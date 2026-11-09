@@ -1,0 +1,171 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Planet Forge</title>
+    <link rel="stylesheet" href="/src/style.css" />
+  </head>
+  <body>
+    <div id="app">
+      <header id="topbar">
+        <div class="brand">Planet Forge</div>
+        <div class="seg" id="viewToggle">
+          <button data-view="map" class="on">Map</button>
+          <button data-view="globe">Globe</button>
+        </div>
+        <label class="field">Layer <select id="layer"></select></label>
+        <label class="field" id="monthField">Month
+          <select id="month">
+            <option value="-1">Annual</option>
+            <option value="0">Jan</option><option value="1">Feb</option><option value="2">Mar</option>
+            <option value="3">Apr</option><option value="4">May</option><option value="5">Jun</option>
+            <option value="6">Jul</option><option value="7">Aug</option><option value="8">Sep</option>
+            <option value="9">Oct</option><option value="10">Nov</option><option value="11">Dec</option>
+          </select>
+        </label>
+        <label class="chk"><input type="checkbox" id="rivers" checked /> Rivers</label>
+        <label class="chk"><input type="checkbox" id="arrows" /> Plate motion</label>
+        <label class="chk"><input type="checkbox" id="hotspots" /> Hotspots</label>
+        <div class="spacer"></div>
+        <button id="undo" title="Undo (Ctrl+Z)" disabled>Undo</button>
+        <button id="redo" title="Redo (Ctrl+Y)" disabled>Redo</button>
+        <button id="save" title="Save world file">Save</button>
+        <button id="load" title="Load world file">Load</button>
+        <input type="file" id="loadFile" accept=".planet" hidden />
+        <button id="export" title="Export images">Export ▾</button>
+        <div id="exportMenu" class="popover" hidden>
+          <label class="field">Width
+            <select id="exportWidth">
+              <option value="2048">2048 × 1024</option>
+              <option value="4096" selected>4096 × 2048</option>
+              <option value="8192">8192 × 4096 (~10 s)</option>
+            </select>
+          </label>
+          <button id="exportHeight">16-bit heightmap PNG</button>
+          <button id="exportLayer">Current layer PNG</button>
+          <p class="muted small">Equirectangular, north up, 180°W at the left edge. Heightmap maps −11 000 m…+9 000 m to 0…65535.</p>
+        </div>
+      </header>
+
+      <aside id="left">
+        <section>
+          <h3>World</h3>
+          <label class="row">Seed
+            <span class="inline"><input type="text" id="seed" /><button id="dice" title="Random seed">🎲</button></span>
+          </label>
+          <label class="row">Detail
+            <select id="cells">
+              <option value="20000">Draft (20k cells)</option>
+              <option value="40000">Low (40k)</option>
+              <option value="80000">Medium (80k)</option>
+              <option value="160000">High (160k)</option>
+              <option value="320000">Very high (320k)</option>
+              <option value="640000">Ultra (640k)</option>
+              <option value="1280000" selected>Extreme (1.28M, ~20 s)</option>
+            </select>
+          </label>
+          <label class="row">Layout
+            <select id="layout">
+              <option value="supercontinent">Supercontinent breakup</option>
+              <option value="continents">Several continents</option>
+              <option value="scattered">Scattered landmasses</option>
+            </select>
+          </label>
+          <label class="row">Plates <output for="plates"></output><input type="range" id="plates" min="5" max="30" step="1" /></label>
+          <label class="row">Continental crust <output for="continentalFraction"></output><input type="range" id="continentalFraction" min="0.2" max="0.6" step="0.01" /></label>
+          <label class="row">History (Myr) <output for="historyMyr"></output><input type="range" id="historyMyr" min="0" max="300" step="10" /></label>
+          <label class="row">Hotspots <output for="hotspotCount"></output><input type="range" id="hotspotCount" min="0" max="40" step="1" /></label>
+          <div class="gen-buttons">
+            <button id="newWorld" class="primary" title="Roll a new random seed and generate">New random world</button>
+            <button id="generate" title="Rebuild the world from the seed and settings above">Generate from seed</button>
+          </div>
+        </section>
+
+        <section>
+          <h3>Planet</h3>
+          <label class="row">Sea level (m) <output for="seaLevel"></output><input type="range" id="seaLevel" min="-1500" max="1500" step="10" /></label>
+          <div class="inline small-gap"><span class="muted">Fit to</span><input type="number" id="landPct" min="5" max="80" value="30" />% <span class="muted">land</span><button id="fitSea">Fit</button></div>
+          <label class="row">Axial tilt <output for="axialTiltDeg"></output><input type="range" id="axialTiltDeg" min="0" max="60" step="0.5" /></label>
+          <label class="row">Temperature offset (°C) <output for="temperatureOffset"></output><input type="range" id="temperatureOffset" min="-15" max="15" step="0.5" /></label>
+          <label class="row">Rotation
+            <select id="retrograde"><option value="false">Prograde (Earth-like)</option><option value="true">Retrograde</option></select>
+          </label>
+          <label class="row">Erosion <output for="erosion"></output><input type="range" id="erosion" min="0" max="3" step="0.1" /></label>
+          <label class="row">River threshold (m³/s) <output for="riverThreshold"></output><input type="range" id="riverThreshold" min="50" max="3000" step="50" /></label>
+          <p class="muted small" id="worldStats"></p>
+        </section>
+
+        <section>
+          <h3>Edit</h3>
+          <div class="tools" id="tools">
+            <button data-tool="inspect" class="on" title="Inspect / pan (1)">Inspect</button>
+            <button data-tool="land" title="Extend continents — grows continental crust and its plate (2)">Land</button>
+            <button data-tool="sea" title="Flood land — thins continental crust (3)">Shallow sea</button>
+            <button data-tool="deepsea" title="Rift into new ocean floor (4)">Rift ocean</button>
+            <button data-tool="raise" title="Young mountains — thickens crust (5)">Mountains</button>
+            <button data-tool="raiseOld" title="Old, eroded highlands (6)">Old highlands</button>
+            <button data-tool="lower" title="Lower terrain — thins crust (7)">Lower</button>
+            <button data-tool="island" title="Add an island; choose or auto-pick its cause (8)">Island</button>
+            <button data-tool="hotspot" title="Add a mantle plume (9)">Hotspot</button>
+            <button data-tool="plate" title="Drag to set a plate's velocity (0)">Plate motion</button>
+          </div>
+          <div id="brushOpts">
+            <label class="row">Brush radius (km) <output for="brushRadius"></output><input type="range" id="brushRadius" min="50" max="1500" step="10" value="300" /></label>
+            <label class="row">Strength <output for="brushStrength"></output><input type="range" id="brushStrength" min="0.1" max="1" step="0.05" value="0.6" /></label>
+          </div>
+          <div id="islandOpts" hidden>
+            <label class="row">Cause
+              <select id="islandCause">
+                <option value="auto">Auto (most feasible)</option>
+                <option value="hotspot">Hotspot volcano</option>
+                <option value="arc">Island arc (subduction)</option>
+                <option value="atoll">Atoll (subsided volcano)</option>
+                <option value="microcontinent">Continental fragment</option>
+                <option value="shelf">Exposed continental shelf</option>
+                <option value="sediment">Delta / barrier island</option>
+              </select>
+            </label>
+            <label class="row">Island size (km) <output for="islandSize"></output><input type="range" id="islandSize" min="20" max="250" step="5" value="70" /></label>
+          </div>
+          <div id="hotspotOpts" hidden>
+            <label class="row">Plume strength <output for="hotspotStrength"></output><input type="range" id="hotspotStrength" min="0.1" max="1" step="0.05" value="0.5" /></label>
+          </div>
+          <p class="muted small" id="toolHint"></p>
+          <div class="inline small-gap advance">
+            <button id="advance">Advance time</button>
+            <input type="number" id="advanceMyr" min="1" max="100" value="10" /> <span class="muted">Myr</span>
+          </div>
+        </section>
+      </aside>
+
+      <main id="viewport">
+        <canvas id="mapCanvas"></canvas>
+        <canvas id="globeCanvas"></canvas>
+        <canvas id="overlay"></canvas>
+        <div id="busy" hidden><div class="label"></div><div class="bar"><div class="fill"></div></div></div>
+        <div id="toast" hidden></div>
+      </main>
+
+      <aside id="right">
+        <section>
+          <h3>Inspector</h3>
+          <div id="inspector"></div>
+        </section>
+        <section>
+          <h3>Legend</h3>
+          <div id="legend"></div>
+        </section>
+        <section>
+          <h3>Edit log</h3>
+          <div id="log"><p class="muted">Edits and the natural causes they were attributed to appear here.</p></div>
+        </section>
+        <section>
+          <h3>Geological history</h3>
+          <div id="history" class="small"></div>
+        </section>
+      </aside>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

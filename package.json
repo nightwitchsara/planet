@@ -1,0 +1,25 @@
+{
+  "name": "planet-forge",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Semi-random, process-driven world generator and editor for grand strategy maps",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit",
+    "render": "tsx scripts/render.ts",
+    "selftest": "tsx scripts/selftest.ts"
+  },
+  "dependencies": {
+    "delaunator": "^5.0.1"
+  },
+  "devDependencies": {
+    "@types/delaunator": "^5.0.3",
+    "@types/node": "^22.10.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2",
+    "vite": "^6.0.7"
+  }
+}
