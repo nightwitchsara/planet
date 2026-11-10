@@ -1,12 +1,14 @@
 import { buildMeshMap, buildSphereMesh, nearestCell, type MeshMap, type SphereMesh } from '../core/mesh';
 import { seedFor } from '../core/rng';
 import { type BiomeResult, computeBiomes } from './biomes';
+import { type Channels, computeChannels } from './channels';
 import { type Climate, computeClimate, LAPSE, MONTHS } from './climate';
 import { computeLithology, type Lithology, ROCK_NAMES } from './geology';
 import { glacialErosion, ICE_AGE_SEA_LEVEL, ICE_ISOSTASY, iceAgeCooling, type IceSheet, simulateIce } from './glaciers';
 import { computeHydrology, type Hydrology, oceanMask, slopeScale } from './hydrology';
 import { aeolianDeposits, type Deposits, erode, type ErosionResult, finalizeDeposits, glacialDeposits, rockTraits } from './sediment';
 import { computeRelief, type Relief, seaLevelForLandFraction } from './relief';
+import { computeSoils, type Soils } from './soils';
 import { analyzeBoundaries, type Boundaries } from './tectonics/boundaries';
 import { initialGeology } from './tectonics/init';
 import { compactPlates, TectonicSim } from './tectonics/sim';
@@ -90,6 +92,10 @@ export class World {
   iceAge!: { thick: Float32Array; erosion: Float32Array; scour: Float32Array };
   hydro!: Hydrology;
   biomes!: BiomeResult;
+  /** Soil order (soils.ts Soil), farming fertility and salinity per cell. */
+  soils!: Soils;
+  /** River channel patterns per cell, and the distributary networks of deltas and fans. */
+  channels!: Channels;
   slope!: Float32Array;
   timings: Record<string, number> = {};
 
@@ -274,13 +280,57 @@ export class World {
     this.hydro = computeHydrology(fine, elev, this.ocean, this.water, precip, this.temp, this.slope, this.relief.rough, R);
     T('hydrology', t);
     t = performance.now();
-    this.deposits = finalizeDeposits(fine, this.ocean, eroded, glacial, wind, this.hydro, tempYear, this.precipYear, this.petYear, legacy.scour);
+    this.deposits = finalizeDeposits(fine, this.ocean, eroded, glacial, wind, this.hydro, tempYear, this.precipYear, this.petYear, legacy.scour, elev, params.radiusKm);
     this.timings.deposits = tDeposits + performance.now() - t;
 
     t = performance.now();
     progress('Biomes', 0.92);
     this.biomes = computeBiomes(fine, elev, this.temp, precip, this.ocean, this.hydro, this.water);
     T('biomes', t);
+    t = performance.now();
+    progress('Soils', 0.97);
+    this.soils = computeSoils(fine, {
+      ocean: this.ocean,
+      elev,
+      slope: this.slope,
+      rough: this.relief.rough,
+      temp: this.temp,
+      precip,
+      water: this.water,
+      hydro: this.hydro,
+      biome: this.biomes.biome,
+      rock: lith.rock,
+      rockAge: lith.rockAge,
+      deposits: this.deposits,
+      iceAgeThick: this.iceAge.thick,
+      volc: this.geo.volc,
+      volcAge: this.geo.volcAge,
+    });
+    T('soils', t);
+    t = performance.now();
+    progress('River channels', 0.99);
+    this.channels = computeChannels(fine, {
+      radiusKm: params.radiusKm,
+      seed: params.seed,
+      elev,
+      ocean: this.ocean,
+      hydro: this.hydro,
+      deposits: this.deposits,
+      erodibility: lith.erodibility,
+      sandyRock: rockTraits(lith.rock, ROCK_NAMES).sandy,
+      biome: this.biomes.biome,
+      temp: this.temp,
+      precipYear: this.precipYear,
+      petYear: this.petYear,
+      rough: this.relief.rough,
+      iceCover: this.ice.cover,
+      iceAgeErosion: this.iceAge.erosion,
+      // The smallest stream ever drawn: at the deepest zoom with the river
+      // threshold at its minimum (render/context.ts clamps it to 1 m³/s).
+      // Changing the threshold redraws rivers without re-deriving the world.
+      minDischarge: 1,
+    });
+    T('channels', t);
     progress('Done', 1);
   }
 

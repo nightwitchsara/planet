@@ -1,5 +1,6 @@
+import { MinHeap } from '../core/heap';
 import { smoothstep } from '../core/math';
-import { cellsWithin, type MeshMap, type SphereMesh } from '../core/mesh';
+import type { MeshMap, SphereMesh } from '../core/mesh';
 import { type Climate, MONTHS } from './climate';
 import { type GlacialLegacy, ICE_AGE_SEA_LEVEL, type IceSheet } from './glaciers';
 import { depressionCells, detailRatio, type Hydrology, LakeKind, REFERENCE_CELLS, route, slopeScale, Wetland } from './hydrology';
@@ -50,7 +51,7 @@ export const DEPOSIT_COLORS: readonly (readonly [number, number, number])[] = [
   [104, 152, 96],
   [212, 160, 88],
   [64, 158, 146],
-  [118, 146, 186],
+  [190, 200, 168],
   [236, 230, 210],
   [240, 204, 112],
   [216, 186, 140],
@@ -187,6 +188,12 @@ const SHELF_FILL = -4;
 const DELTA_TOP = 2;
 /** Only rivers draining at least this much (runoff-weighted km²) carry enough sediment to build a delta plain. */
 const DELTA_BASIN = 4e5;
+/** A delta plain grows to about this share of its river's (runoff-weighted) basin, and no larger than this (km²). */
+const DELTA_SHARE = 0.012;
+const DELTA_MAX_KM2 = 60000;
+/** …or a river delivering at least this much sediment over the run (km³) builds one, of about this area per km³ (km²). */
+const DELTA_SUPPLY = 20000;
+const DELTA_PER_KM3 = 0.3;
 /** Water deeper than this carries river sediment away down the continental slope. */
 export const SHELF_EDGE = -400;
 /** Unconsolidated sediment erodes this many times faster than average bedrock, once this thick (m). */
@@ -201,8 +208,13 @@ const BEDLOAD_CAPACITY = 600;
 /** Share of the excess bedload a reach drops each pass, and the steepest fan surface it can build (m/m). */
 const FAN_SHARE = 0.5;
 const FAN_SLOPE = 0.012;
-/** A reach fed by a stream at least this steep (m/m) and several times its own slope lies at a mountain front. */
-const FAN_APEX = 0.006;
+/**
+ * A reach fed by a stream at least this steep (m/m), itself nearly flat (at
+ * most FAN_TOE and a quarter of the stream's gradient), lies at a mountain
+ * front; elsewhere excess bedload is valley fill.
+ */
+const FAN_APEX = 0.01;
+const FAN_TOE = 0.004;
 /** Share of the mud a river carries that its plume takes out over the shelf edge. */
 const MUD_BYPASS = 0.35;
 
@@ -235,6 +247,14 @@ function weatheringRegime(n: number, w: WeatheringInputs) {
 }
 
 /**
+ * Passes the erosion run is split into. Sediment fills a chain of hollows and
+ * spills on to the next, and outlets cut back, a little each pass, so a finer
+ * mesh (more, smaller hollows between the same mountains) needs more passes
+ * for its drainage to join up into rivers as fully as a coarser one does.
+ */
+export const erosionSteps = (n: number): number => Math.max(6, Math.round(6 * Math.sqrt(Math.max(n, 80000) / 80000)));
+
+/**
  * Fluvial erosion, transport and deposition with a closed sediment budget.
  * Detachment-limited stream power is solved implicitly in flood order
  * (Braun & Willett 2013): dh/dt = -K·k·A^m·S, with k the rock's erodibility
@@ -256,7 +276,7 @@ export function erode(
   strength: number,
   radiusKm: number,
   weathering: WeatheringInputs,
-  iterations = 6,
+  iterations = erosionSteps(mesh.n),
 ): ErosionResult {
   const { n, nbrStart, nbr, nbrDist, nbrEdge, area, x, y, z } = mesh;
   const sed = new Float32Array(n);
@@ -342,13 +362,21 @@ export function erode(
   // its distance from the divide, so the erosion it sees grows with the cell
   // size (√ of it). Scaling K the other way keeps a world the same at every
   // detail level (calibrated at 320k cells).
-  const K = 0.1 * strength * detailRatio(n) ** 0.25;
+  // The run is split into `iterations` passes; each does its share of the work.
+  // (Splitting the run more finely erodes a little less in all; (passes/6)^0.18 makes up for it.)
+  const dt = (6 / iterations) * (iterations / 6) ** 0.18;
+  const K = 0.1 * strength * detailRatio(n) ** 0.25 * dt;
   const erod = weathering.erodibility;
   /** River gradients as the reference detail measures them (floodplains and fans form where they are gentle). */
   const flatScale = slopeScale(n);
   /** A big river's delta plain covers about one cell of the reference detail. */
   const deltaArea = (4 * Math.PI * R2) / REFERENCE_CELLS;
+  const front = new MinHeap(256);
+  const stamp = new Int32Array(n);
+  let tag = 0;
   const A = new Float64Array(n);
+  /** Distance (km) from each cell to its receiver. */
+  const dRc = new Float32Array(n);
   const madeC = new Float64Array(n);
   const madeF = new Float64Array(n);
   const qsC = new Float64Array(n);
@@ -366,7 +394,7 @@ export function erode(
     wEdge[k] = nbrEdge[k] / nbrDist[k];
     wSum += wEdge[k];
   }
-  const D = (0.08 * (4 * Math.PI)) / wSum;
+  const D = (0.08 * dt * (4 * Math.PI)) / wSum;
   const e0 = new Float32Array(n);
   const outV = new Float64Array(n);
   const gain = new Float64Array(n);
@@ -388,7 +416,12 @@ export function erode(
       rec.river = river;
     }
     if (elev[o] < SHELF_EDGE) {
-      budget.lost += supply;
+      // A steep coast: the delta front builds down the slope into deep water;
+      // what it cannot hold runs on down submarine canyons.
+      const put = Math.min(supply, (SHELF_FILL - elev[o]) * areaKm2(o));
+      addDep(o, put / areaKm2(o), qc / supply, P_SHELF);
+      rec.front += put;
+      budget.lost += supply - put;
       return;
     }
     const plume = qf * MUD_BYPASS;
@@ -406,22 +439,37 @@ export function erode(
     const left = fillBasin(shelf, v, SHELF_FILL, sandShare, P_SHELF);
     rec.front += v - left;
     v = left;
-    // Once its shelf is full, a big river builds its delta plain out above the sea.
-    const need = (DELTA_TOP - elev[o]) * areaKm2(o);
-    if (basinArea >= DELTA_BASIN && need > 0 && v >= need) {
-      addDep(o, DELTA_TOP - elev[o], sandShare, P_DELTA);
-      rec.plain += need;
-      v -= need;
-      // On a finer mesh the plain builds on out over the shallowest shelf beside the mouth.
-      let built = areaKm2(o);
-      for (const s of shelf) {
-        if (s === o || elev[s] >= DELTA_TOP || built + areaKm2(s) > 1.2 * deltaArea) continue;
-        const more = (DELTA_TOP - elev[s]) * areaKm2(s);
-        if (v < more) break;
-        addDep(s, DELTA_TOP - elev[s], sandShare, P_DELTA);
-        rec.plain += more;
-        v -= more;
+    // Once its shelf is full, a big river builds its delta plain out above the
+    // sea, over the shallowest water in front of it first. Delta plains cover
+    // about a percent of their river's basin (the Nile's, Mississippi's and
+    // Niger's do; the Ganges' and Mekong's several), more for a muddy river
+    // out of easily eroded country.
+    const runSupply = (supply / 1000) * iterations;
+    if ((basinArea >= DELTA_BASIN || runSupply >= DELTA_SUPPLY) && v > 0) {
+      const target = Math.min(DELTA_MAX_KM2, Math.max(1.2 * deltaArea, DELTA_SHARE * basinArea, DELTA_PER_KM3 * runSupply));
+      const cosR = Math.cos((2 * Math.sqrt(target / Math.PI)) / radiusKm + 1.5 * mesh.spacing);
+      tag++;
+      front.clear();
+      front.push(0, o);
+      stamp[o] = tag;
+      let built = 0;
+      while (front.size > 0 && built < target) {
+        const s = front.pop();
+        if (elev[s] < DELTA_TOP) {
+          const more = (DELTA_TOP - elev[s]) * areaKm2(s);
+          if (v < more) break;
+          addDep(s, DELTA_TOP - elev[s], sandShare, P_DELTA);
+          rec.plain += more;
+          v -= more;
+        }
         built += areaKm2(s);
+        for (let k = nbrStart[s], e = nbrStart[s + 1]; k < e; k++) {
+          const m = nbr[k];
+          if (stamp[m] === tag || !ocean[m] || x[m] * x[o] + y[m] * y[o] + z[m] * z[o] < cosR) continue;
+          stamp[m] = tag;
+          // Outward from the mouth, shallow water a little sooner: a lobe, not a strip along the coast or a ring round a deep bay.
+          front.push(distKm(m, o) + 0.15 * (DELTA_TOP - elev[m]), m);
+        }
       }
     }
     budget.lost += v;
@@ -443,14 +491,13 @@ export function erode(
     return v - f * wedge;
   };
 
-  const PT: Record<string, number> = { route: 0, incise: 0, sed: 0, slope: 0 };
-  (globalThis as any).__PT = PT;
   for (let it = 0; it < iterations; it++) {
-    let tq = performance.now();
     const r = route(mesh, elev, ocean);
-    PT.route += performance.now() - tq; tq = performance.now();
     const { order, receiver, basin, count } = r;
-    for (let c = 0; c < n; c++) A[c] = ocean[c] ? 0 : areaKm2(c) * (0.3 + 0.7 * Math.min(2, runoff[c] / 500));
+    for (let c = 0; c < n; c++) {
+      A[c] = ocean[c] ? 0 : areaKm2(c) * (0.3 + 0.7 * Math.min(2, runoff[c] / 500));
+      if (receiver[c] >= 0) dRc[c] = distKm(c, receiver[c]);
+    }
     for (let i = count - 1; i >= 0; i--) {
       const c = order[i];
       const rc = receiver[c];
@@ -467,7 +514,7 @@ export function erode(
       const hr = ocean[rc] ? 0 : elev[rc];
       if (elev[c] <= hr) continue;
       const k = (erod ? erod[c] : 1) * (1 + (K_SEDIMENT - 1) * Math.min(1, sed[c] / SEDIMENT_REF));
-      const F = (K * k * Math.sqrt(A[c])) / Math.max(1, distKm(c, rc));
+      const F = (K * k * Math.sqrt(A[c])) / Math.max(1, dRc[c]);
       const h = (elev[c] + F * hr) / (1 + F);
       const lower = elev[c] - h;
       elev[c] = h;
@@ -484,7 +531,6 @@ export function erode(
       madeF[c] = (fromSed - sandOut) * a + solid * (1 - coarse[c]);
     }
 
-    PT.incise += performance.now() - tq; tq = performance.now();
     // Sediment routing, upstream to downstream.
     const pits = depressionCells(r, elev);
     qsC.fill(0);
@@ -506,7 +552,7 @@ export function erode(
           qf = left - qc;
         }
       } else if (rc >= 0 && !ocean[rc]) {
-        const dx = distKm(c, rc) * 1000;
+        const dx = dRc[c] * 1000;
         const s = ((elev[c] - elev[rc]) / dx) * flatScale;
         const a = areaKm2(c);
         const cap = BEDLOAD_CAPACITY * A[c] * Math.max(0, s);
@@ -517,7 +563,7 @@ export function erode(
           if (vol > 0) {
             const fromC = Math.min(qc, 0.85 * vol);
             const fromF = Math.min(qf, vol - fromC);
-            addDep(c, (fromC + fromF) / a, fromC / (fromC + fromF), steepIn[c] > Math.max(FAN_APEX, 3 * s) ? P_FAN : P_ALLUVIUM);
+            addDep(c, (fromC + fromF) / a, fromC / (fromC + fromF), steepIn[c] >= FAN_APEX && s <= Math.min(FAN_TOE, 0.25 * steepIn[c]) ? P_FAN : P_ALLUVIUM);
             qc -= fromC;
             qf -= fromF;
           }
@@ -551,7 +597,6 @@ export function erode(
       }
     }
 
-    PT.sed += performance.now() - tq; tq = performance.now();
     // Hillslope creep and wash: downhill to neighbors, gathering at slope feet
     // and spilling off coasts. Land is not pulled below 1 m.
     e0.set(elev);
@@ -600,10 +645,8 @@ export function erode(
       addDep(m, fit / area[m], gainSand[m] / gain[m], P_SHELF);
       budget.lost += (gain[m] - fit) * R2;
     }
-    PT.slope += performance.now() - tq;
   }
-  const tf = performance.now(); const res = finish(); PT.finish = performance.now() - tf;
-  return res;
+  return finish();
 }
 
 /**
@@ -613,7 +656,10 @@ export function erode(
  * tides, and a big supply into quiet water builds a river-dominated delta.
  */
 function classifyDeltas(mesh: SphereMesh, ocean: Uint8Array, elev: Float32Array, recs: DeltaRecord[], radiusKm: number): DeltaRecord[] {
-  const keep = recs.filter((r) => r.plain > 0 || r.supply >= 1500).map((r) => ({
+  let most = 0;
+  for (const r of recs) most = Math.max(most, r.supply);
+  // Mouths that built a plain, or brought at least ~1.5 km³ and a few thousandths of the largest load.
+  const keep = recs.filter((r) => r.plain > 0 || r.supply >= Math.max(1500, 0.003 * most)).map((r) => ({
     ...r,
     supply: r.supply / 1000,
     sand: r.sand / 1000,
@@ -621,29 +667,109 @@ function classifyDeltas(mesh: SphereMesh, ocean: Uint8Array, elev: Float32Array,
     front: r.front / 1000,
   }));
   if (keep.length === 0) return keep;
-  const supplies = keep.map((r) => r.supply).sort((a, b) => a - b);
-  const typical = supplies[Math.floor(supplies.length / 2)];
-  const reach = 400 / radiusKm;
+  const typical = medianSupply(keep);
+  const energy = mouthEnergy(mesh, ocean, elev, radiusKm);
   for (const r of keep) {
-    const { cells } = cellsWithin(mesh, r.mouth, reach);
+    energy(r);
+    r.kind = deltaKind(r, typical);
+  }
+  return keep;
+}
+
+function medianSupply(recs: DeltaRecord[]): number {
+  const supplies = recs.map((r) => r.supply).sort((a, b) => a - b);
+  return supplies[Math.floor(supplies.length / 2)];
+}
+
+/** Even the biggest river's delta is reworked where waves or tides are strong enough. */
+function deltaKind(r: DeltaRecord, typical: number): DeltaKind {
+  const river = (0.75 * r.supply) / (r.supply + 3 * typical);
+  return river >= r.wave && river >= r.tide ? 'river' : r.wave >= r.tide ? 'wave' : 'tide';
+}
+
+/**
+ * Sets a record's wave energy and tidal range from the coast within ~400 km
+ * of its mouth: how open it is to the ocean, and how much of that sea is shelf.
+ */
+function mouthEnergy(mesh: SphereMesh, ocean: Uint8Array, elev: Float32Array, radiusKm: number): (r: DeltaRecord) => void {
+  const { x, y, z, nbrStart, nbr } = mesh;
+  const cosR = Math.cos(400 / radiusKm);
+  const stamp = new Int32Array(mesh.n);
+  const queue: number[] = [];
+  let tag = 0;
+  return (r) => {
+    const o = r.mouth;
+    tag++;
+    queue.length = 0;
+    queue.push(o);
+    stamp[o] = tag;
     let sea = 0;
     let shelf = 0;
-    for (const c of cells) {
-      if (!ocean[c]) continue;
-      sea++;
-      if (elev[c] > -200) shelf++;
+    for (let i = 0; i < queue.length; i++) {
+      const c = queue[i];
+      if (ocean[c]) {
+        sea++;
+        if (elev[c] > -200) shelf++;
+      }
+      for (let k = nbrStart[c], e = nbrStart[c + 1]; k < e; k++) {
+        const m = nbr[k];
+        if (stamp[m] === tag) continue;
+        stamp[m] = tag;
+        if (x[m] * x[o] + y[m] * y[o] + z[m] * z[o] >= cosR) queue.push(m);
+      }
     }
-    const open = sea / cells.length;
+    const open = sea / queue.length;
     const shelfShare = sea > 0 ? shelf / sea : 0;
     const lat = Math.abs((mesh.lat[r.mouth] * 180) / Math.PI);
     const storms = Math.exp(-(((lat - 52) / 13) ** 2));
     const trades = Math.exp(-(((lat - 18) / 9) ** 2));
-    r.wave = Math.min(1, open ** 1.5 * (0.25 + 0.85 * storms + 0.35 * trades));
-    r.tide = Math.min(1, shelfShare * (0.45 + 0.7 * (1 - open)));
-    const river = r.supply / (r.supply + 3 * typical);
-    r.kind = river >= r.wave && river >= r.tide ? 'river' : r.wave >= r.tide ? 'wave' : 'tide';
+    r.wave = Math.min(1, open ** 1.5 * (0.3 + 0.9 * storms + 0.4 * trades));
+    r.tide = Math.min(1, shelfShare * (0.6 + 0.8 * (1 - open)));
+  };
+}
+
+/**
+ * One record per river mouth as the world ends up. Over the erosion passes a
+ * delta builds land over its old mouths and the river reaches the sea further
+ * out each time (and neighboring rivers can come to share one outlet), so the
+ * records of every old mouth are summed at the mouth the river has now, and
+ * waves, tides and the delta type are worked out there.
+ */
+function mergeDeltas(mesh: SphereMesh, ocean: Uint8Array, elev: Float32Array, hydro: Hydrology, recs: DeltaRecord[], radiusKm: number): DeltaRecord[] {
+  const { receiver } = hydro.routing;
+  const { drainage, endorheic } = hydro;
+  const { nbrStart, nbr } = mesh;
+  const byOutlet = new Map<number, DeltaRecord>();
+  for (const r of recs) {
+    let land = r.river >= 0 && !ocean[r.river] ? r.river : !ocean[r.mouth] ? r.mouth : -1;
+    if (land < 0) {
+      // Drowned since: the nearest land beside the old mouth, if any.
+      for (let k = nbrStart[r.mouth], e = nbrStart[r.mouth + 1]; k < e && land < 0; k++) if (!ocean[nbr[k]]) land = nbr[k];
+      if (land < 0) continue;
+    }
+    const out = drainage[land];
+    if (out < 0 || endorheic[out] || receiver[out] < 0 || !ocean[receiver[out]]) continue;
+    let m = byOutlet.get(out);
+    if (!m) {
+      m = { mouth: receiver[out], river: out, basin: 0, supply: 0, sand: 0, plain: 0, front: 0, wave: 0, tide: 0, kind: 'river' };
+      byOutlet.set(out, m);
+    }
+    m.basin = Math.max(m.basin, r.basin);
+    m.supply += r.supply;
+    m.sand += r.sand;
+    m.plain += r.plain;
+    m.front += r.front;
   }
-  return keep;
+  const merged = [...byOutlet.values()];
+  if (merged.length === 0) return merged;
+  const typical = medianSupply(merged);
+  const energy = mouthEnergy(mesh, ocean, elev, radiusKm);
+  for (const r of merged) {
+    energy(r);
+    r.kind = deltaKind(r, typical);
+  }
+  // Biggest first, so a delta's index says how much it matters.
+  return merged.sort((a, b) => b.plain + b.front - (a.plain + a.front));
 }
 
 // ------------------------------------------------------------------ ice-age glaciers
@@ -862,6 +988,18 @@ export function aeolianDeposits(
   const sumAI = new Float64Array(nc);
   const sumBare = new Float64Array(nc);
   const sumElev = new Float64Array(nc);
+  // The wind cannot dig below the water table, which stands near the level the
+  // ground drains to: deflation stops at a cell's outlet, so it never digs a
+  // closed hollow. Rivers flush sand from their beds, so the wind never dams a
+  // drainage line either (see the deposition step).
+  const flow = route(fine, bed, ocean);
+  const upArea = new Float64Array(n);
+  for (let c = 0; c < n; c++) if (!ocean[c]) upArea[c] = fine.area[c];
+  for (let i = flow.count - 1; i >= 0; i--) {
+    const c = flow.order[i];
+    const rc = flow.receiver[c];
+    if (rc >= 0 && !ocean[rc]) upArea[rc] += upArea[c];
+  }
   for (let c = 0; c < n; c++) {
     if (ocean[c]) continue;
     const ai = precipYear[c] / Math.max(1, petYear[c]);
@@ -877,9 +1015,18 @@ export function aeolianDeposits(
     sumElev[k] += bed[c] * a;
     // Sand: loose fluvial sand and gravel, and outwash; fines: the muddy part of river and lake deposits.
     const sed = fl.deposit[c];
-    const sandF = Math.min(fl.sand[c], 40) * DEFLATE_SAND * bare[c];
-    const fineF = Math.min(Math.max(0, sed - fl.sand[c]), 30) * DEFLATE_FINES * bare[c];
-    const ow = gl.outwash[c] * DEFLATE_SAND * Math.max(bare[c], 0.3);
+    let sandF = Math.min(fl.sand[c], 40) * DEFLATE_SAND * bare[c];
+    let fineF = Math.min(Math.max(0, sed - fl.sand[c]), 30) * DEFLATE_FINES * bare[c];
+    let ow = gl.outwash[c] * DEFLATE_SAND * Math.max(bare[c], 0.3);
+    const rc = flow.receiver[c];
+    const room = rc >= 0 && flow.basin[c] < 0 ? Math.max(0, bed[c] - (ocean[rc] ? 0 : bed[rc]) - 0.5) : 0;
+    const want = sandF + fineF + ow;
+    if (want > room) {
+      const k = room / want;
+      sandF *= k;
+      fineF *= k;
+      ow *= k;
+    }
     const flourV = gl.flour[c] * FLOUR_TO_WIND;
     if (sandF + fineF > 0 && sed > 0) {
       // Deflation lowers the river deposits it came from.
@@ -966,7 +1113,7 @@ export function aeolianDeposits(
     const b = sumBare[k] / landArea[k];
     const ai = sumAI[k] / landArea[k];
     pS[k] = Math.max(0.15, Math.min(1, 0.25 + 0.4 * low + 0.7 * (1 - b)));
-    pL[k] = Math.max(0.02, Math.min(0.7, 0.02 + 0.35 * smoothstep(0.12, 0.5, ai)));
+    pL[k] = Math.min(0.7, 0.004 + 0.4 * smoothstep(0.12, 0.5, ai));
   }
   const settle = (src: Float64Array, p: Float32Array): Float64Array => {
     const dep = new Float64Array(nc);
@@ -1044,7 +1191,7 @@ export function aeolianDeposits(
     }
     const low = cnt ? smoothstep(0, 150, mean / cnt - bed[c]) : 0;
     catchS[c] = 0.02 + bare[c] * bare[c] * (0.15 + low) ** 1.5;
-    catchL[c] = (0.3 + trap[c]) * (1 - 0.7 * smoothstep(0.02, 0.12, steep));
+    catchL[c] = (0.05 + trap[c]) * (1 - 0.7 * smoothstep(0.02, 0.12, steep));
     const a = fine.area[c] * R2;
     meanS[f2c.nearest[c]] += catchS[c] * a;
     meanL[f2c.nearest[c]] += catchL[c] * a;
@@ -1073,9 +1220,51 @@ export function aeolianDeposits(
   if (rawS <= 0) budget.toSea += totS;
   if (rawL <= 0) budget.toSea += totL;
   for (let c = 0; c < n; c++) {
-    if (ocean[c]) continue;
     dunes[c] *= kS;
     loess[c] *= kL;
+  }
+  // Along a drainage line (a cell gathering several cells' water) sand and dust
+  // can't build the bed up above the ground draining into it: floods carry the
+  // excess on, and it settles on the open ground nearby instead.
+  const cap = new Float32Array(n).fill(Infinity);
+  for (let c = 0; c < n; c++) {
+    const rc = flow.receiver[c];
+    if (ocean[c] || rc < 0 || ocean[rc] || upArea[rc] < 4 * fine.area[rc]) continue;
+    cap[rc] = Math.min(cap[rc], Math.max(0, bed[c] - bed[rc] - 0.5));
+  }
+  for (let pass = 0; pass < 3; pass++) {
+    let spillS = 0;
+    let spillL = 0;
+    let freeS = 0;
+    let freeL = 0;
+    for (let c = 0; c < n; c++) {
+      if (ocean[c]) continue;
+      const a = fine.area[c];
+      const tot = dunes[c] + loess[c];
+      if (tot > cap[c]) {
+        const k = cap[c] / tot;
+        spillS += dunes[c] * (1 - k) * a;
+        spillL += loess[c] * (1 - k) * a;
+        dunes[c] *= k;
+        loess[c] *= k;
+      } else if (cap[c] === Infinity) {
+        freeS += dunes[c] * a;
+        freeL += loess[c] * a;
+      }
+    }
+    if (spillS + spillL <= 0) break;
+    const gS = freeS > 0 ? 1 + spillS / freeS : 1;
+    const gL = freeL > 0 ? 1 + spillL / freeL : 1;
+    for (let c = 0; c < n; c++) {
+      if (ocean[c] || cap[c] !== Infinity) continue;
+      dunes[c] *= gS;
+      loess[c] *= gL;
+    }
+    if (freeS <= 0) budget.toSea += (spillS * R2) / 1;
+    if (freeL <= 0) budget.toSea += (spillL * R2) / 1;
+  }
+  for (let c = 0; c < n; c++) {
+    if (ocean[c]) continue;
     bed[c] += dunes[c] + loess[c];
     const a = fine.area[c] * R2;
     budget.dunes += dunes[c] * a;
@@ -1127,6 +1316,8 @@ export function finalizeDeposits(
   precipYear: Float32Array,
   petYear: Float32Array,
   scour: Float32Array,
+  elev: Float32Array,
+  radiusKm: number,
 ): Deposits {
   const n = mesh.n;
   const kind = new Uint8Array(n);
@@ -1202,6 +1393,33 @@ export function finalizeDeposits(
     kind[c] = k;
     thickness[c] = th;
   }
+  // A lone cell of one deposit amid another is finer than the cells resolve:
+  // it takes its neighbors' kind (deltas, peat bogs and playas stay put).
+  const { nbrStart, nbr } = mesh;
+  const counts = new Int32Array(DEPOSIT_NAMES.length);
+  const lone: [number, number][] = [];
+  for (let c = 0; c < n; c++) {
+    const k = kind[c];
+    if (ocean[c] || k === Deposit.Delta || k === Deposit.Peat || k === Deposit.Playa) continue;
+    counts.fill(0);
+    let land = 0;
+    let same = false;
+    for (let e = nbrStart[c]; e < nbrStart[c + 1] && !same; e++) {
+      const m = nbr[e];
+      if (ocean[m]) continue;
+      land++;
+      same = kind[m] === k;
+      counts[kind[m]]++;
+    }
+    if (same || land < 3) continue;
+    let best = 0;
+    for (let q = 1; q < counts.length; q++) if (counts[q] > counts[best]) best = q;
+    if (2 * counts[best] >= land) lone.push([c, best]);
+  }
+  for (const [c, k] of lone) {
+    kind[c] = k;
+    thickness[c] = k === Deposit.Bedrock ? 0 : k === Deposit.Residual ? regolith[c] : cover[c];
+  }
   const budget: SedimentBudget = { ...fl.budget, glacial: gl.budget, wind: ae.budget };
-  return { kind, thickness, cover, regolith, sand, deltas: fl.deltas, budget };
+  return { kind, thickness, cover, regolith, sand, deltas: mergeDeltas(mesh, ocean, elev, hydro, fl.deltas, radiusKm), budget };
 }
