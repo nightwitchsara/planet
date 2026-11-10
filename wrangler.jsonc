@@ -1,0 +1,10 @@
+{
+  // Cloudflare deploy: the build command runs `npm run build`, then
+  // `npx wrangler deploy` uploads dist/ as static assets.
+  // "name" must match the Worker's name in the Cloudflare dashboard.
+  "name": "planet",
+  "compatibility_date": "2026-11-01",
+  "assets": {
+    "directory": "./dist"
+  }
+}
