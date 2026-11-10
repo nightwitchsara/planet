@@ -2,10 +2,8 @@ import * as pal from '../render/palettes';
 import type { LayerId } from '../render/raster';
 import { BIOME_INFO, KOPPEN_CODES, KOPPEN_COLORS, KOPPEN_NAMES } from '../world/biomes';
 import type { EditReport } from '../world/edits';
-import { CHANNEL_NAMES } from '../world/channels';
 import { ROCK_INFO } from '../world/geology';
 import { DEPOSIT_COLORS, DEPOSIT_NAMES } from '../world/sediment';
-import { Soil, SOIL_COUNT, SOIL_INFO } from '../world/soils';
 import type { InspectInfo, WorldSummary } from '../worker/protocol';
 
 const MONTH_NAMES = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
@@ -91,27 +89,8 @@ export function legendHtml(layer: LayerId, summary: WorldSummary | null): string
         '<p class="muted">The loose material over the bedrock: what rivers, ice and wind laid down, peat in bogs, or rock weathered in place. Fans and dune fields gather in dry basins, loess downwind of deserts and ice-age outwash, till and moraines where the ice sheets stood.</p>' +
         swatches(DEPOSIT_NAMES.map((name, i) => ({ color: DEPOSIT_COLORS[i], label: name })))
       );
-    case 'soils': {
-      const salt = SOIL_INFO[Soil.Aridisol].color.map((v, i) => v + ((i === 2 ? 246 : 250) - v) * 0.45);
-      return (
-        '<p class="muted">Soil orders (USDA), from the parent material (bedrock or what covers it), the climate, vegetation, drainage and slope, and how long the surface has weathered: young soils on fresh silt, dunes, glacial drift and mountain slopes; deep leached red earths on old tropical land.</p>' +
-        swatches([
-          ...SOIL_INFO.slice(0, SOIL_COUNT).map((s) => ({ color: s.color, label: `${s.order} — ${s.name}` })),
-          { color: salt, label: 'Salt-crusted (saline) soil' },
-        ])
-      );
-    }
-    case 'fertility':
-      return (
-        gradientBar(pal.FERTILITY, (v) => v.toFixed(2).replace(/0+$/, '').replace(/\.$/, ''), [0, 0.25, 0.5, 0.75, 1]) +
-        '<p class="muted">Farming fertility, 0–1. High on volcanic ash, loess, fresh river silt, limestone and basalt, and on grassland black earths; low on old leached tropical soils, podzols, desert, frozen and salty soils, and wherever the ground is thin, steep or waterlogged.</p>'
-      );
     case 'drainage':
-      return '<p class="muted">Each color is one drainage basin: all land whose water leaves through the same river mouth or ends in the same inland lake or salt flat. Blue lines are rivers above the discharge threshold; dashed ones run only part of the year. Arrows point the way the water flows.</p>';
-    case 'channels':
-      return `<p class="muted">Each river colored by its channel pattern, which follows from its stream power, bed grain size, bank strength and how much room its valley gives it. Floodplains are shaded warm; the belts of braided rivers show their bare bars (tan) and of anastomosing rivers their islands (green). Delta plains, alluvial fans and inland deltas are tinted with the color of their distributary channels, which split from the river at the apex and spread to every mouth or die out across the cone.</p>${swatches(
-        CHANNEL_NAMES.map((label, i) => ({ color: pal.CHANNEL_COLORS[i + 1], label: i === 0 ? 'Small stream (unclassified)' : label })),
-      )}`;
+      return '<p class="muted">Each color is one drainage basin: all land whose water leaves through the same river mouth or ends in the same inland lake or salt flat. Blue lines are rivers above the discharge threshold; dashed ones run only part of the year.</p>';
   }
 }
 
@@ -167,7 +146,6 @@ export function inspectorHtml(info: InspectInfo | null): string {
     ['Plate', `${info.plate.name} · ${info.plate.speed.toFixed(1)} cm/yr → ${info.plate.dir}`],
     ['Crust', `${info.crust.continental ? 'Continental' : 'Oceanic'}, ${info.crust.thickness.toFixed(0)} km${info.crust.continental ? '' : `, ${info.crust.age.toFixed(0)} Myr old`}`],
   ];
-  if (info.soil) rows.push(['Soil', info.soil]);
   if (info.surface) rows.push(['Surface', info.surface]);
   if (info.bedrock) rows.push(['Bedrock', info.bedrock]);
   if (info.boundary) rows.push(['Boundary', info.boundary]);

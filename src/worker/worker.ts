@@ -6,13 +6,11 @@ import { deserializeWorld, serializeWorld } from '../io/save';
 import { buildFields, type FieldData, type MeshData, meshData, shareable } from '../render/context';
 import { BASE_LEVEL, levelForWidth, levelHeight, levelWidth, type PixelWindow, type RenderOptions, renderWindow } from '../render/raster';
 import { BIOME_INFO, KOPPEN_CODES, KOPPEN_NAMES } from '../world/biomes';
-import { Channel, type DeltaForm, type Distributaries } from '../world/channels';
 import { MONTHS } from '../world/climate';
 import * as edits from '../world/edits';
 import { ROCK_INFO } from '../world/geology';
 import { LakeKind } from '../world/hydrology';
 import { Deposit, DEPOSIT_NAMES } from '../world/sediment';
-import { Soil, SOIL_INFO, soilName } from '../world/soils';
 import {
   B_CONVERGENT, B_DIVERGENT, B_TRANSFORM, ROLE_COLLISION, ROLE_OVERRIDING, ROLE_SUBDUCTING,
 } from '../world/tectonics/boundaries';
@@ -180,7 +178,6 @@ function describeSetting(w: World, c: number): { setting: string; boundary: stri
   else if (!cont) setting = `Abyssal ocean floor, ${g.age[c].toFixed(0)} Myr old`;
   else if (g.thick[c] > 42 && g.orogeny[c] < 40) setting = 'Young mountain belt';
   else if (g.thick[c] > 38) setting = `Old mountain belt (last uplift ~${g.orogeny[c].toFixed(0)} Myr ago, now eroded)`;
-  else if (e >= 0 && networkAt(w, c)) setting = describeNetwork(networkAt(w, c)!);
   else if (e >= 0 && w.sediment[c] > 1 && nextToSea(w, c) && e < 15) setting = 'River delta — land built out into the sea by river sediment';
   else if (e >= 0 && w.sediment[c] > 20) setting = `Alluvial plain — ~${Math.round(w.sediment[c])} m of river sediment over the bedrock`;
   else if (e < 0 && w.sediment[c] > 20) setting = 'Sediment-filled shelf off a river mouth';
@@ -204,14 +201,6 @@ const DELTA_FORMS = {
   tide: 'tide-dominated: funnel-shaped channels between tidal flats',
 };
 
-function describeSoil(w: World, c: number): string | null {
-  const s = w.soils;
-  const lk = w.hydro.lake[c];
-  if (!s || w.ocean[c] || s.order[c] === Soil.None || w.water.glacier[c] || (lk >= 0 && w.hydro.lakes[lk].kind !== LakeKind.SaltFlat)) return null;
-  const o = s.order[c];
-  return `${SOIL_INFO[o].order} — ${soilName(o, w.deposits.kind[c], s.saline[c] === 1)}, fertility ${s.fertility[c].toFixed(2)}`;
-}
-
 function describeSurface(w: World, c: number): string | null {
   const d = w.deposits;
   if (!d) return null;
@@ -221,9 +210,7 @@ function describeSurface(w: World, c: number): string | null {
   if (k === Deposit.Bedrock) return d.regolith[c] < 0.3 ? 'Bare rock and rubble' : `Bedrock under ${m(d.regolith[c])} of soil`;
   if (k === Deposit.Residual) return `Rock rotted in place: ${m(d.regolith[c])} of saprolite under a leached, iron-rich soil`;
   let s = `${DEPOSIT_NAMES[k]}, ${m(d.thickness[c])}`;
-  const net = networkAt(w, c);
-  if (k === Deposit.Delta && net && net.kind === 'delta' && d.deltas[net.delta]) s += `, ${DELTA_FORMS[d.deltas[net.delta].kind]}`;
-  else if (k === Deposit.Delta) {
+  if (k === Deposit.Delta) {
     const { x, y, z } = w.fine;
     let best = null;
     let bd = -2;
@@ -288,72 +275,6 @@ function regimeOf(w: World, c: number): string | null {
   return `Perennial, ${source}; ${swing < 2.5 ? 'steady through the year' : `high water in ${MONTH_NAMES[hi]}, lowest in ${MONTH_NAMES[lo]}`}`;
 }
 
-/** The delta, fan or inland delta whose plain covers cell c, if any. */
-function networkAt(w: World, c: number): Distributaries | null {
-  const ch = w.channels;
-  if (!ch) return null;
-  const i = ch.networkOf[c];
-  return i >= 0 ? ch.networks[i] : null;
-}
-
-const FORM_NAMES: Record<DeltaForm, string> = {
-  birdfoot: "Bird's-foot delta — distributaries run out on their own levees into deep, quiet water",
-  lobate: 'Lobate delta — distributaries fan out over overlapping lobes of river sediment',
-  arcuate: 'Arcuate delta — waves smooth its front into an arc of beach ridges',
-  cuspate: 'Cuspate delta — strong waves draw its front out to a point of beach ridges',
-  estuarine: 'Tide-dominated delta — funnel-shaped channels between tidal flats and islands',
-  fan: 'Alluvial fan — channels spread from where the river leaves the hills',
-  inland: 'Inland delta — the river splits over flat dry country and much of its water evaporates',
-};
-
-function describeNetwork(net: Distributaries): string {
-  let mouths = 0;
-  for (let j = 0; j < net.mouth.length; j++) mouths += net.mouth[j];
-  const r = net.radiusKm >= 10 ? Math.round(net.radiusKm) : net.radiusKm.toFixed(1);
-  const what = net.kind === 'delta' ? `${mouths} distributary mouth${mouths === 1 ? '' : 's'}, ${r} km from its apex to the sea` : `${mouths} channel end${mouths === 1 ? '' : 's'}, ${r} km across`;
-  return `${FORM_NAMES[net.form]} (${what})`;
-}
-
-const lengthText = (m: number): string => (m >= 1000 ? `${(m / 1000).toFixed(m >= 10000 ? 0 : 1)} km` : `${Math.round(m / 10) * 10 || Math.round(m)} m`);
-
-function bedName(mm: number): string {
-  if (mm >= 64) return 'cobble';
-  if (mm >= 2) return `gravel (~${Math.round(mm)} mm)`;
-  if (mm >= 0.5) return 'coarse sand';
-  if (mm >= 0.25) return 'medium sand';
-  return 'fine sand';
-}
-
-/** Plain-language channel pattern of the river through cell c (channels.ts). */
-function describeChannel(w: World, c: number): string | null {
-  const ch = w.channels;
-  if (!ch || !ch.pattern[c]) return null;
-  const bed = `${bedName(ch.grain[c])} bed`;
-  const k = Math.round(ch.threads[c]);
-  const power = `stream power ${ch.power[c] >= 10 ? Math.round(ch.power[c]) : ch.power[c].toFixed(1)} W/m²`;
-  switch (ch.pattern[c] as Channel) {
-    case Channel.Confined:
-      return `Confined between valley walls, ${bed}; ${power}`;
-    case Channel.Straight:
-      return `Straight channel ${lengthText(ch.belt[c])} wide, ${bed}; ${power}`;
-    case Channel.Meandering:
-      return `Meandering (sinuosity ${ch.sinuosity[c].toFixed(1)}) over a floodplain ${lengthText(ch.floodplain[c])} wide, ${bed}; ${power}`;
-    case Channel.Wandering:
-      return `Wandering: one main channel with bars and side channels, ${lengthText(ch.belt[c])} across, ${bed}; ${power}`;
-    case Channel.Braided:
-      return `Braided: ~${k} channels across a braidplain ${lengthText(ch.belt[c])} wide, ${bed}; ${power}`;
-    case Channel.Anastomosing:
-      return `Anastomosing: ${k} channels around wooded islands, ${lengthText(ch.belt[c])} across, ${bed}; ${power}`;
-    case Channel.Distributary: {
-      const net = networkAt(w, c);
-      const where = net ? (net.kind === 'delta' ? 'over its delta' : net.kind === 'fan' ? 'over its fan' : 'over its inland delta') : 'downstream';
-      return `Splitting into distributaries ${where}${k > 1 ? ` (~${k} here)` : ''}, ${bed}`;
-    }
-    default:
-      return null;
-  }
-}
-
 const WETLAND_NAMES = [
   '',
   'River floodplain, flooded in high water',
@@ -391,9 +312,7 @@ function inspect(w: World, lat: number, lon: number): InspectInfo {
     : null;
   const k = w.biomes.koppen[c];
   const code = k < KOPPEN_CODES.length ? KOPPEN_CODES[k] : null;
-  const flow = regimeOf(w, c);
-  const channel = flow && !lk ? describeChannel(w, c) : null;
-  const regime = flow && channel ? `${flow}. ${channel}` : flow;
+  const regime = regimeOf(w, c);
   return {
     lat,
     lon,
@@ -404,7 +323,6 @@ function inspect(w: World, lat: number, lon: number): InspectInfo {
     setting,
     bedrock: describeBedrock(w, c),
     surface: describeSurface(w, c),
-    soil: describeSoil(w, c),
     boundary,
     tempMonthly: Array.from(w.temp.subarray(c * MONTHS, c * MONTHS + MONTHS)),
     precipMonthly: Array.from(w.precip.subarray(c * MONTHS, c * MONTHS + MONTHS)),

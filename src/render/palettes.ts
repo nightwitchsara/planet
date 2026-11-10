@@ -14,16 +14,6 @@ export function ramp(stops: Stops, v: number): RGB {
   return stops[stops.length - 1][1];
 }
 
-/** Farming fertility 0–1: barren grey-brown through straw to deep green. */
-export const FERTILITY: Stops = [
-  [0, [118, 100, 86]],
-  [0.15, [168, 146, 108]],
-  [0.35, [216, 196, 112]],
-  [0.55, [170, 190, 82]],
-  [0.75, [90, 156, 62]],
-  [1, [26, 104, 44]],
-];
-
 export const HYPSO: Stops = [
   [0, [64, 112, 74]],
   [200, [102, 142, 82]],
@@ -102,19 +92,3 @@ export function hashColor(i: number): RGB {
   h ^= h >>> 16;
   return [80 + (h & 127), 80 + ((h >>> 8) & 127), 80 + ((h >>> 16) & 127)];
 }
-
-/**
- * River colors on the channel-pattern layer, by pattern code (world/channels.ts
- * Channel + 1; 0: unknown).
- */
-export const CHANNEL_COLORS: readonly RGB[] = [
-  [40, 90, 200],
-  [112, 128, 164],
-  [150, 78, 40],
-  [96, 96, 210],
-  [28, 92, 222],
-  [0, 160, 160],
-  [232, 116, 18],
-  [30, 148, 60],
-  [196, 40, 168],
-];

@@ -607,36 +607,24 @@ export function computeHydrology(
       qMax = Math.max(qMax, Q[o + m]);
     }
     const q = discharge[c];
-    // Channel losses over ~80 km of river, whatever the mesh: a cell's own
-    // share grows with the length of river in it.
-    const rc = receiver[c];
-    const dxKm = rc >= 0 ? Math.acos(Math.min(1, x[c] * x[rc] + y[c] * y[rc] + z[c] * z[rc])) * radiusKm : 80;
-    const loss80 = 1 - (1 - lossShare[c]) ** (80 / Math.max(5, dxKm));
-    const inflow = q / Math.max(0.05, 1 - lossShare[c]);
-    // A river spreading its seasonal flood over flat, dry country and losing
-    // water as it goes splits into an inland delta (the Niger's, the
-    // Okavango, the Sudd); in wetter country the same flood makes a floodplain.
-    const spreads = p < 0.5 * wb.petYear[c] && qMax > 3 * q && inflow > 30 && slope[c] < 1.2e-4 && (loss80 > 0.05 || q > 150);
     if (marsh[c]) wetland[c] = Wetland.Marsh;
-    else if (spreads) wetland[c] = Wetland.InlandDelta;
     else if (q > 150 && (qMax > 1.8 * q || elev[c] < 150)) wetland[c] = Wetland.Floodplain;
-    else if (loss80 > 0.25 && inflow > 15) wetland[c] = Wetland.InlandDelta;
+    else if (lossShare[c] > 0.25 && q / (1 - lossShare[c]) > 15) wetland[c] = Wetland.InlandDelta;
     else if (tAnn < 4 && wb.soil[c] > 0.75 && wb.runoffYear[c] > 80) wetland[c] = Wetland.Peatland;
     else if (tAnn > 16 && elev[c] < 250 && wb.ground[c] > 80 && p > wb.petYear[c]) wetland[c] = Wetland.Swamp;
   }
-  // A floodplain or inland delta spans about a reference cell's width (~40 km)
-  // on any mesh: on finer ones it spreads from its river's cells onto their
-  // flat neighbors.
+  // A floodplain spans about a reference cell's width (~40 km) on any mesh: on
+  // finer ones it spreads from its river's cells onto their flat neighbors.
   const reach = 0.46 * mesh.spacing * Math.sqrt(n / REFERENCE_CELLS);
   if (n > 1.5 * REFERENCE_CELLS) {
     const { nbrStart, nbr, nbrDist } = mesh;
     const plain: number[] = [];
-    for (let c = 0; c < n; c++) if (wetland[c] === Wetland.Floodplain || wetland[c] === Wetland.InlandDelta) plain.push(c);
+    for (let c = 0; c < n; c++) if (wetland[c] === Wetland.Floodplain) plain.push(c);
     for (const c of plain) {
       for (let k = nbrStart[c], e = nbrStart[c + 1]; k < e; k++) {
         const m = nbr[k];
         if (nbrDist[k] > reach || wetland[m] !== Wetland.None || ocean[m] || lake[m] >= 0 || wb.glacier[m] || slope[m] > 1.2e-3) continue;
-        wetland[m] = wetland[c];
+        wetland[m] = Wetland.Floodplain;
       }
     }
   }

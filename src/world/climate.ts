@@ -19,20 +19,7 @@ const B_EFF = 4.5;
 /** Strongest thermal (monsoon) wind perturbation (m/s). */
 const MONSOON_MAX = 6;
 /** Moisture mixing by extratropical storm systems (m²/s). */
-const EDDY_DIFFUSIVITY = 3e6;
-/**
- * Latitudes (°) where the eddy mixing sets in and reaches full strength: the
- * storm tracks start at the subtropics' poleward edge and carry most of the
- * water that reaches the mid-latitudes, peaking near 40°.
- */
-const EDDY_FROM = 22;
-const EDDY_FULL = 42;
-/** Poleward wind (m/s) on the moist western flank of a subtropical high (and equatorward on its eastern flank). */
-const HIGH_FLANK_WIND = 3;
-/** How much the high's western flank weakens subsidence there, and its eastern flank strengthens it. */
-const HIGH_FLANK_SUBSIDENCE = 0.7;
-/** How far (°) the storm track shifts toward the equator in winter. */
-const STORM_WINTER_SHIFT = 7;
+const EDDY_DIFFUSIVITY = 1.5e6;
 export const LAPSE = 6.5; // K per km
 const SECTORS = 24;
 const LAT_BANDS = 180;
@@ -115,12 +102,6 @@ function zonalEBM(meanQ: Float64Array, offset: number): Float64Array {
   return T;
 }
 
-/** 0 in a hemisphere's winter month, 1 at the height of its summer (sea-level air lags the sun by about a month). */
-const summerOf = (phiDeg: number, month: number): number => {
-  const c = Math.cos((2 * Math.PI * (month + 0.5 - 7)) / 12);
-  return 0.5 + 0.5 * (phiDeg >= 0 ? c : -c);
-};
-
 const bump = (v: number, a: number, peak: number, b: number): number =>
   v <= a || v >= b ? 0 : v < peak ? Math.sin(((v - a) / (peak - a)) * (Math.PI / 2)) : Math.cos(((v - peak) / (b - peak)) * (Math.PI / 2));
 
@@ -130,7 +111,7 @@ const bump = (v: number, a: number, peak: number, b: number): number =>
  * cold eastern upwelling in the subtropics, warm drift reaching the eastern
  * side of subpolar basins.
  */
-function gyreGrid(mesh: SphereMesh, land: Float32Array): { isLand: Uint8Array; W: number; H: number } {
+function currentAnomaly(mesh: SphereMesh, land: Float32Array, retrograde: boolean): Float32Array {
   const W = 180;
   const H = 90;
   const isLand = new Uint8Array(W * H);
@@ -154,49 +135,6 @@ function gyreGrid(mesh: SphereMesh, land: Float32Array): { isLand: Uint8Array; W
       }
     }
   }
-  return { isLand, W, H };
-}
-
-/** Blur a gyre-grid field across rows and its neighbors (bins where `keep` is 0 only), then sample it per cell. */
-function blurAndSample(mesh: SphereMesh, grid: Float32Array, isLand: Uint8Array, W: number, H: number, oceanOnly: boolean): Float32Array {
-  const tmp = new Float32Array(W * H);
-  for (let pass = 0; pass < 3; pass++) {
-    for (let j = 0; j < H; j++) {
-      for (let i = 0; i < W; i++) {
-        const p = j * W + i;
-        if (oceanOnly && isLand[p]) continue;
-        let s = 0;
-        let wsum = 0;
-        for (let dj = -2; dj <= 2; dj++) {
-          const jj = j + dj;
-          if (jj < 0 || jj >= H) continue;
-          for (let di = -1; di <= 1; di++) {
-            const q = jj * W + ((i + di + W) % W);
-            if (oceanOnly && isLand[q]) continue;
-            s += grid[q];
-            wsum++;
-          }
-        }
-        tmp[p] = s / wsum;
-      }
-    }
-    for (let p = 0; p < W * H; p++) if (!oceanOnly || !isLand[p]) grid[p] = tmp[p];
-  }
-  const out = new Float32Array(mesh.n);
-  for (let c = 0; c < mesh.n; c++) {
-    const j = Math.max(0, Math.min(H - 1, Math.floor(((Math.PI / 2 - mesh.lat[c]) / Math.PI) * H)));
-    const i = Math.max(0, Math.min(W - 1, Math.floor(((mesh.lon[c] + Math.PI) / (2 * Math.PI)) * W)));
-    out[c] = grid[j * W + i];
-  }
-  return out;
-}
-
-/**
- * Sea-surface temperature anomaly from wind-driven gyres, by position within
- * each ocean basin along a latitude circle (see currentAnomaly's caller).
- */
-function currentAnomaly(mesh: SphereMesh, land: Float32Array, retrograde: boolean): Float32Array {
-  const { isLand, W, H } = gyreGrid(mesh, land);
   const anomGrid = new Float32Array(W * H);
   for (let j = 0; j < H; j++) {
     const la = Math.PI / 2 - ((j + 0.5) * Math.PI) / H;
@@ -232,60 +170,37 @@ function currentAnomaly(mesh: SphereMesh, land: Float32Array, retrograde: boolea
   }
   // Currents are broad features: blur across rows (ocean bins only) so that
   // row-to-row differences in coastline geometry don't streak the field.
-  const out = blurAndSample(mesh, anomGrid, isLand, W, H, true);
-  for (let c = 0; c < mesh.n; c++) if (land[c] > 0.5) out[c] = 0;
-  return out;
-}
-
-/**
- * Which side of a subtropical high each place lies on, -1 to 1. The highs sit
- * over the eastern parts of the ocean basins: on their western flank warm,
- * moist air flows poleward onto the eastern sides of the continents (Florida,
- * southern China, eastern Australia, southern Brazil: +1), while on their
- * eastern flank dry air sinks and flows toward the equator along the western
- * coasts (the Sahara and Namib, Atacama, Sonora, western Australia: -1).
- * Along each latitude circle: +1 at the western edge of an ocean basin and the
- * eastern coast of a continent, -1 at the eastern edge of a basin and the
- * western coast of a continent. Retrograde rotation mirrors it.
- */
-function subtropicalSide(mesh: SphereMesh, land: Float32Array, retrograde: boolean): Float32Array {
-  const { isLand, W, H } = gyreGrid(mesh, land);
-  const side = new Float32Array(W * H);
-  for (let j = 0; j < H; j++) {
-    const la = Math.PI / 2 - ((j + 0.5) * Math.PI) / H;
-    if (bump(Math.abs(la / DEG), 6, 27, 48) === 0) continue;
-    const row = isLand.subarray(j * W, j * W + W);
-    let start = -1;
-    for (let i = 0; i < W; i++) {
-      if (row[i] !== row[(i - 1 + W) % W]) {
-        start = i;
-        break;
-      }
-    }
-    if (start < 0) continue; // all ocean or all land: no highs anchored to coasts
-    const kmPerBin = (2 * Math.PI * 6371 * Math.cos(la)) / W;
-    for (let k = 0; k < W; k++) {
-      const i0 = (start + k) % W;
-      if (row[i0] === row[(i0 - 1 + W) % W]) continue;
-      const kind = row[i0];
-      let len = 0;
-      while (len < W && row[(i0 + len) % W] === kind) len++;
-      for (let t = 0; t < len; t++) {
-        const u = (t + 0.5) / len;
-        let v: number;
-        if (kind) {
-          // Land: moist flow reaches ~1500 km in from the east coast, dry air ~1000 km in from the west.
-          const fromEast = (len - t - 0.5) * kmPerBin;
-          const fromWest = (t + 0.5) * kmPerBin;
-          v = Math.exp(-fromEast / 1500) - Math.exp(-fromWest / 1000);
-        } else {
-          v = (1 - 2 * u) * Math.min(1, (len * kmPerBin) / 3000);
+  const tmp = new Float32Array(W * H);
+  for (let pass = 0; pass < 3; pass++) {
+    for (let j = 0; j < H; j++) {
+      for (let i = 0; i < W; i++) {
+        const p = j * W + i;
+        if (isLand[p]) continue;
+        let s = 0;
+        let wsum = 0;
+        for (let dj = -2; dj <= 2; dj++) {
+          const jj = j + dj;
+          if (jj < 0 || jj >= H) continue;
+          for (let di = -1; di <= 1; di++) {
+            const q = jj * W + ((i + di + W) % W);
+            if (isLand[q]) continue;
+            s += anomGrid[q];
+            wsum++;
+          }
         }
-        side[j * W + ((i0 + t) % W)] = retrograde ? -v : v;
+        tmp[p] = s / wsum;
       }
     }
+    for (let p = 0; p < W * H; p++) if (!isLand[p]) anomGrid[p] = tmp[p];
   }
-  return blurAndSample(mesh, side, isLand, W, H, false);
+  const out = new Float32Array(mesh.n);
+  for (let c = 0; c < mesh.n; c++) {
+    if (land[c] > 0.5) continue;
+    const j = Math.max(0, Math.min(H - 1, Math.floor(((Math.PI / 2 - mesh.lat[c]) / Math.PI) * H)));
+    const i = Math.max(0, Math.min(W - 1, Math.floor(((mesh.lon[c] + Math.PI) / (2 * Math.PI)) * W)));
+    out[c] = anomGrid[j * W + i];
+  }
+  return out;
 }
 
 /**
@@ -437,7 +352,6 @@ export function computeClimate(mesh: SphereMesh, elev: Float32Array, land: Float
   const zonalT = zonalEBM(Q0, params.temperatureOffset);
 
   const current = currentAnomaly(mesh, land, params.retrograde);
-  const side = subtropicalSide(mesh, land, params.retrograde);
 
   // Annual-mean wind for the maritime-influence tracer.
   const annE = new Float32Array(n);
@@ -499,6 +413,7 @@ export function computeClimate(mesh: SphereMesh, elev: Float32Array, land: Float
     const s = Math.sin(phi);
     const albedo = 0.32 + 0.1 * s * s;
     const m = Math.min(1, maritime[c]);
+    const C = m * C_OCEAN + (1 - m) * C_LAND;
     // Snowy high-latitude interiors radiate heat away in winter: colder annual means.
     const interior = land[c] > 0.5 ? -3.5 * (1 - m) * Math.max(0, Math.min(1, (Math.abs(phi / DEG) - 20) / 40)) : 0;
     const base = zonalT[j] + (land[c] > 0.5 ? anomLand[c] : current[c]) + interior;
@@ -507,21 +422,12 @@ export function computeClimate(mesh: SphereMesh, elev: Float32Array, land: Float
     let h2re = 0;
     let h2im = 0;
     for (let k = 1; k <= 2; k++) {
-      // H = (1-α) / (B + i k ω C). A place under maritime air part of the
-      // time follows the ocean's damped, lagging cycle that share of the time
-      // and the land's own the rest: blending the responses, not the heat
-      // capacities (which would let a little sea air flatten a whole continent's
-      // seasons), keeps continental summers hot and winters cold.
-      const resp = (cap: number): [number, number] => {
-        const br = B_EFF;
-        const bi = k * OMEGA * cap;
-        const den = br * br + bi * bi;
-        return [((1 - albedo) * br) / den, (-(1 - albedo) * bi) / den];
-      };
-      const [or, oi] = resp(C_OCEAN);
-      const [lr, li] = resp(C_LAND);
-      const hr = m * or + (1 - m) * lr;
-      const hi = m * oi + (1 - m) * li;
+      // H = (1-α) / (B + i k ω C)
+      const br = B_EFF;
+      const bi = k * OMEGA * C;
+      const den = br * br + bi * bi;
+      const hr = ((1 - albedo) * br) / den;
+      const hi = (-(1 - albedo) * bi) / den;
       const qr = Qre[k - 1][j];
       const qi = Qim[k - 1][j];
       if (k === 1) {
@@ -638,7 +544,7 @@ export function computeClimate(mesh: SphereMesh, elev: Float32Array, land: Float
     for (let k = nbrStart[c], e = nbrStart[c + 1]; k < e; k++) {
       const m = nbr[k];
       const phi = (0.5 * (Math.abs(lat[c]) + Math.abs(lat[m]))) / DEG;
-      const K = EDDY_DIFFUSIVITY * smoothstep(EDDY_FROM, EDDY_FULL, phi);
+      const K = EDDY_DIFFUSIVITY * smoothstep(25, 50, phi);
       eddy[k] = (K * geom.len[k]) / (mesh.nbrDist[k] * R * 1000 * geom.areaM[c]);
       eddySum[c] += eddy[k];
     }
@@ -706,11 +612,9 @@ export function computeClimate(mesh: SphereMesh, elev: Float32Array, land: Float
         my *= k;
         mz *= k;
       }
-      // The subtropical highs' flanks: poleward on the western flank, equatorward on the eastern; strongest in summer.
-      const flank = HIGH_FLANK_WIND * side[c] * bump(Math.abs(phiDeg), 10, 27, 42) * (0.6 + 0.4 * summerOf(phiDeg, mo)) * Math.sign(phiDeg);
-      wx[c] = e * geom.ex[c] + (nn + flank) * geom.nx[c] + mx;
-      wy[c] = e * geom.ey[c] + (nn + flank) * geom.ny[c] + my;
-      wz[c] = e * geom.ez[c] + (nn + flank) * geom.nz[c] + mz;
+      wx[c] = e * geom.ex[c] + nn * geom.nx[c] + mx;
+      wy[c] = e * geom.ey[c] + nn * geom.ny[c] + my;
+      wz[c] = e * geom.ez[c] + nn * geom.nz[c] + mz;
       windE[c * MONTHS + mo] = wx[c] * geom.ex[c] + wy[c] * geom.ey[c] + wz[c] * geom.ez[c];
       windN[c * MONTHS + mo] = wx[c] * geom.nx[c] + wy[c] * geom.ny[c] + wz[c] * geom.nz[c];
       tSurf[c] = tempSL[c * MONTHS + mo] - (LAPSE * hSurf[c]) / 1000;
@@ -754,23 +658,15 @@ export function computeClimate(mesh: SphereMesh, elev: Float32Array, land: Float
           evap[c] = e;
         } else {
           const pet = T > 0 ? (3.3 * T ** 1.25) / DAYS_PER_MONTH : 0;
-          // Land gives back the share of its rain the Budyko curve (Fu's form)
-          // expects: most of it where evaporative demand far outstrips rain,
-          // under half where rain is plentiful. Dry interiors recycle their
-          // rain, which carries moisture deep into the continents.
-          const phi = pet / Math.max(1e-6, P[c]);
-          evap[c] = P[c] * (1 + phi - (1 + phi ** 2.6) ** (1 / 2.6));
+          evap[c] = Math.min(pet, 0.6 * P[c]);
         }
         const rh = q[c] / qs;
         const phiDeg = Math.abs(lat[c] / DEG);
-        // Storm tracks follow the polar front toward the equator in winter.
-        const shift = STORM_WINTER_SHIFT * (1 - summerOf(lat[c] / DEG, mo));
-        const storm = 0.12 * bump(phiDeg, 28 - shift, 52 - shift, 92);
+        const storm = 0.12 * bump(phiDeg, 28, 52, 92);
         // Warm surfaces destabilize the column: summer convective showers.
         const convective = 0.045 * Math.max(0, Math.min(1, (T - 10) / 18)) * Math.min(1, rh / 0.45);
         let r = 0.1 * Math.max(0, (rh - 0.25) / 0.75) ** 1.3 + storm * Math.min(1, rh / 0.5) + convective;
-        const sub = side[c] * bump(phiDeg, 10, 27, 42);
-        if (div[c] > 0) r *= Math.exp(-div[c] * 1.6e5 * (1 - HIGH_FLANK_SUBSIDENCE * (sub > 0 ? sub : 0.7 * sub)));
+        if (div[c] > 0) r *= Math.exp(-div[c] * 1.6e5);
         else r += 4e4 * -div[c];
         const lift = wx[c] * gradH[3 * c] + wy[c] * gradH[3 * c + 1] + wz[c] * gradH[3 * c + 2];
         if (lift > 0) r += 9 * lift;
