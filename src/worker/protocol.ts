@@ -112,6 +112,8 @@ export interface InspectInfo {
   bedrock: string | null;
   /** Loose material over the bedrock: what it is, how thick, what lies under it. */
   surface: string | null;
+  /** Soil order, its plain name and farming fertility, e.g. "Mollisol — prairie black earth, fertility 0.86". */
+  soil: string | null;
   boundary: string | null;
   tempMonthly: number[];
   precipMonthly: number[];

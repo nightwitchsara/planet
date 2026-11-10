@@ -145,7 +145,7 @@ for (const l of world.historyLog) console.log('  ' + l);
   }
   const sb = world.sedimentBudget;
   const pct = (v: number) => `${((100 * v) / (sb.eroded || 1)).toFixed(0)}%`;
-  console.log(`sediment ${(sb.eroded / 1e6).toFixed(2)}M km³: basins ${pct(sb.basins)}, floodplains ${pct(sb.floodplains)}, shelves ${pct(sb.shelves)}, deltas ${pct(sb.deltas)}, to the deep sea ${pct(sb.lost)}`);
+  console.log(`sediment ${(sb.eroded / 1e6).toFixed(2)}M km³ (+${(sb.crept / 1e6).toFixed(2)}M by hillslopes): dissolved ${pct(sb.dissolved)}, basins ${pct(sb.basins)}, floodplains ${pct(sb.floodplains)}, fans ${pct(sb.fans)}, slope deposits ${pct(sb.colluvium)}, shelves ${pct(sb.shelves)}, deltas ${pct(sb.deltas)}, to the deep sea ${pct(sb.lost)}; ${world.deposits.deltas.filter((d) => d.plain > 0).length} delta plains`);
   for (const l of [...h.lakes].sort((a, b) => b.areaKm2 - a.areaKm2).slice(0, 4)) {
     const o = l.outlet;
     console.log(`  ${['fresh', 'salt', 'flat'][l.kind]} lake ${Math.round(l.areaKm2 / 1000)}k km² at ${((fine.lat[o] * 180) / Math.PI).toFixed(0)}°, ${((fine.lon[o] * 180) / Math.PI).toFixed(0)}°: inflow ${Math.round(l.inflow)} m³/s, PET ${Math.round(wb.petYear[o])} mm, P ${Math.round(world.precipYear[o])} mm`);
