@@ -200,6 +200,72 @@ function floodOrder(mesh: SphereMesh, r: Routing, elev: Float32Array, groupOf: I
   return out;
 }
 
+/** Closed basins found by a first pass of the water (computeHydrology). */
+export interface ClosedBasins {
+  /** Per depression group: 1 where the lake stays below its brim. */
+  closed: Uint8Array;
+  /** Lake id per cell in that pass, else -1. */
+  lake: Int32Array;
+}
+
+/**
+ * Routing in which every cell of a closed basin drains down toward its lake:
+ * along the order rising water covers the basin (floodOrder), each cell to its
+ * lowest neighbor nearer the lake, and the lowest point nowhere (receiver -1).
+ * Null if the new routing fails to reach every land cell (it always should).
+ */
+function rerouteClosed(mesh: SphereMesh, r: Routing, elev: Float32Array, ocean: Uint8Array, pits: number[][], closed: Uint8Array): Routing | null {
+  const { n, nbrStart, nbr } = mesh;
+  const receiver = Int32Array.from(r.receiver);
+  const rank = new Int32Array(n).fill(-1);
+  const grp = new Int32Array(n).fill(-1);
+  for (let g = 0; g < pits.length; g++) {
+    const cells = pits[g];
+    if (!closed[g] || cells.length === 0) continue;
+    for (let j = 0; j < cells.length; j++) {
+      rank[cells[j]] = j;
+      grp[cells[j]] = g;
+    }
+    receiver[cells[0]] = -1;
+    for (let j = 1; j < cells.length; j++) {
+      const c = cells[j];
+      let best = -1;
+      for (let k = nbrStart[c], e = nbrStart[c + 1]; k < e; k++) {
+        const m = nbr[k];
+        if (grp[m] !== g || rank[m] >= j) continue;
+        if (best < 0 || elev[m] < elev[best] || (elev[m] === elev[best] && rank[m] < rank[best])) best = m;
+      }
+      if (best >= 0) receiver[c] = best;
+    }
+  }
+  // Processing order again, receivers before donors (Kahn's algorithm).
+  const start = new Int32Array(n + 1);
+  for (let c = 0; c < n; c++) {
+    const rc = receiver[c];
+    if (!ocean[c] && rc >= 0 && !ocean[rc]) start[rc + 1]++;
+  }
+  for (let c = 0; c < n; c++) start[c + 1] += start[c];
+  const donors = new Int32Array(start[n]);
+  const at = start.slice(0, n);
+  for (let c = 0; c < n; c++) {
+    const rc = receiver[c];
+    if (!ocean[c] && rc >= 0 && !ocean[rc]) donors[at[rc]++] = c;
+  }
+  const order = new Int32Array(n);
+  let count = 0;
+  for (let c = 0; c < n; c++) {
+    if (ocean[c]) continue;
+    const rc = receiver[c];
+    if (rc < 0 || ocean[rc]) order[count++] = c;
+  }
+  for (let i = 0; i < count; i++) {
+    const c = order[i];
+    for (let k = start[c]; k < start[c + 1]; k++) order[count++] = donors[k];
+  }
+  if (count !== r.count) return null;
+  return { ...r, receiver, order, count };
+}
+
 /** Mesh detail at which the cell-scale processes were tuned; finer and coarser meshes are scaled to match it. */
 export const REFERENCE_CELLS = 320000;
 /**
@@ -283,6 +349,8 @@ export interface Hydrology {
   meltShare: Float32Array;
   /** Lake id for lake and salt-flat cells, else -1. */
   lake: Int32Array;
+  /** Share of each lake cell under its water (1 across a closed lake or salt flat). */
+  lakeWet: Float32Array;
   lakes: Lake[];
   /** Annual runoff generated in each cell (mm). */
   runoff: Float32Array;
@@ -316,6 +384,7 @@ export function computeHydrology(
   radiusKm: number,
   routing: Routing = route(mesh, elev, ocean),
   shoresDone = false,
+  closedIn?: ClosedBasins,
 ): Hydrology {
   const { n, area, x, y, z } = mesh;
   const { order, receiver, basin, count } = routing;
@@ -325,6 +394,7 @@ export function computeHydrology(
   const lossShare = new Float32Array(n);
   const terminal = new Uint8Array(n);
   const lake = new Int32Array(n).fill(-1);
+  const lakeWet = new Float32Array(n);
   const lakes: Lake[] = [];
   const { groupOf, groups } = basinGroups(mesh, routing);
   const pits = floodOrder(mesh, routing, elev, groupOf, groups);
@@ -340,6 +410,9 @@ export function computeHydrology(
   const held = new Float64Array(groups * MONTHS);
   const heldMelt = new Float64Array(groups);
   const marsh = new Uint8Array(n);
+  /** Groups whose lake stays below its brim (closed basins). */
+  const closedNow = new Uint8Array(groups);
+  const closedG = closedIn?.closed;
   const precipYearOf = (c: number): number => {
     let s = 0;
     for (let m = 0; m < MONTHS; m++) s += precip[c * MONTHS + m];
@@ -377,12 +450,13 @@ export function computeHydrology(
     };
     const id = lakes.length;
     const R2 = radiusKm * radiusKm;
-    if (loss(spill) <= inflow) {
+    if (!closedG?.[g] && loss(spill) <= inflow) {
       // Fills and spills: the lake evens out the seasons for the river below.
       let areaKm2 = 0;
       const share = cells.map((c) => wetShare(c, spill));
       for (let j = 0; j < cells.length; j++) {
         lake[cells[j]] = id;
+        lakeWet[cells[j]] = share[j];
         areaKm2 += area[cells[j]] * R2 * share[j];
       }
       const raw = new Float64Array(MONTHS);
@@ -416,6 +490,8 @@ export function computeHydrology(
     }
     // Closed basin: nothing flows on. Salt builds up only where the climate is
     // dry; in wetter country a closed lake stays fresh.
+    closedNow[g] = 1;
+    terminal[outlet] = 1;
     for (const out of outlets[g]) terminal[out] = 1;
     for (let m = 0; m < MONTHS; m++) Q[o + m] = 0;
     meltQ[outlet] = 0;
@@ -436,8 +512,20 @@ export function computeHydrology(
       let top = -Infinity;
       for (let j = 0; j <= k; j++) {
         lake[cells[j]] = id;
+        lakeWet[cells[j]] = 1;
         areaKm2 += area[cells[j]] * R2;
         top = Math.max(top, elev[cells[j]]);
+      }
+      // The next cell floods in part, as far as the rest of the inflow reaches
+      // (on a coarse mesh a whole cell more would overshoot by far).
+      if (k + 1 < cells.length && costs[k + 1] > 0) {
+        const part = Math.min(1, (inflow - cost) / costs[k + 1]);
+        if (part > 0.05) {
+          const c = cells[k + 1];
+          lake[c] = id;
+          lakeWet[c] = part;
+          areaKm2 += area[c] * R2 * part;
+        }
       }
       const kind = moisture < 0.6 ? LakeKind.Saline : LakeKind.Fresh;
       lakes.push({ kind, level: Math.min(spill, top + 2), areaKm2, inflow, outflow: 0, outlet });
@@ -453,7 +541,10 @@ export function computeHydrology(
       for (const c of cells) {
         if (elev[c] > floor + 2 || (areaKm2 > 0 && wet + annualCost(c) > 3 * inflow)) break;
         wet += annualCost(c);
-        if (flat) lake[c] = id;
+        if (flat) {
+          lake[c] = id;
+          lakeWet[c] = 1;
+        }
         else marsh[c] = 1;
         areaKm2 += area[c] * R2;
       }
@@ -463,6 +554,24 @@ export function computeHydrology(
 
   const heldSettled = new Float64Array(groups);
   const upArea = new Float64Array(n);
+  /** Channel losses where evaporation outpaces rain; small rivers suffer most. */
+  const channelLoss = (c: number, rc: number, o: number): void => {
+    const dxKm = Math.acos(Math.min(1, x[c] * x[rc] + y[c] * y[rc] + z[c] * z[rc])) * radiusKm;
+    let before = 0;
+    let after = 0;
+    for (let m = 0; m < MONTHS; m++) {
+      const q = Q[o + m];
+      const e = wb.pet[o + m];
+      const arid = e > 0 ? Math.max(0, Math.min(1, 1 - precip[o + m] / e)) : 0;
+      const f = Math.min(0.9, ((CHANNEL_LOSS * arid * CHANNEL_LOSS_Q) / (q + CHANNEL_LOSS_Q)) * (dxKm / 80));
+      before += q;
+      Q[o + m] = q * (1 - f);
+      after += Q[o + m];
+    }
+    lossShare[c] = before > 0 ? 1 - after / before : 0;
+    meltQ[c] *= 1 - lossShare[c];
+    settled[c] *= 1 - lossShare[c];
+  };
   // A hollow too shallow to hold a lake is just flat ground: rivers cross it
   // along their own courses instead of having their water pooled and let out
   // through whichever of its outlets comes last.
@@ -477,7 +586,16 @@ export function computeHydrology(
     meltQ[c] += ((wb.meltYear[c] / 1000) * a) / (SECONDS_PER_MONTH * MONTHS);
     upArea[c] += a / 1e6;
     const b = basin[c];
-    if (b >= 0 && !shallow[groupOf[b]]) {
+    const gc = b >= 0 ? groupOf[b] : -1;
+    if (closedIn && gc >= 0 && closedIn.closed[gc]) {
+      // A closed basin, its water running down to its lake (see rerouteClosed):
+      // it evaporates what reaches the lowest point; rivers crossing the dry
+      // floor on the way lose water like any other.
+      if (rc < 0) {
+        settleLake(gc, c);
+        settled[c] = 0;
+      } else if (closedIn.lake[c] < 0) channelLoss(c, rc, o);
+    } else if (b >= 0 && !shallow[gc]) {
       if (rc < 0 || basin[rc] !== b) {
         // A basin outlet: hold its water until every outlet of its group is in.
         const g = groupOf[b];
@@ -498,24 +616,7 @@ export function computeHydrology(
           if (terminal[c]) settled[c] = 0;
         }
       }
-    } else if (rc >= 0) {
-      // Channel losses where evaporation outpaces rain; small rivers suffer most.
-      const dxKm = Math.acos(Math.min(1, x[c] * x[rc] + y[c] * y[rc] + z[c] * z[rc])) * radiusKm;
-      let before = 0;
-      let after = 0;
-      for (let m = 0; m < MONTHS; m++) {
-        const q = Q[o + m];
-        const e = wb.pet[o + m];
-        const arid = e > 0 ? Math.max(0, Math.min(1, 1 - precip[o + m] / e)) : 0;
-        const f = Math.min(0.9, ((CHANNEL_LOSS * arid * CHANNEL_LOSS_Q) / (q + CHANNEL_LOSS_Q)) * (dxKm / 80));
-        before += q;
-        Q[o + m] = q * (1 - f);
-        after += Q[o + m];
-      }
-      lossShare[c] = before > 0 ? 1 - after / before : 0;
-      meltQ[c] *= 1 - lossShare[c];
-      settled[c] *= 1 - lossShare[c];
-    }
+    } else if (rc >= 0) channelLoss(c, rc, o);
     if (rc >= 0 && !ocean[rc]) {
       const ro = rc * MONTHS;
       for (let m = 0; m < MONTHS; m++) Q[ro + m] += Q[o + m];
@@ -574,6 +675,20 @@ export function computeHydrology(
       }
     }
     if (moved > 0) return computeHydrology(mesh, elev, ocean, wb, precip, temp, slope, rough, radiusKm, routing, true);
+  }
+
+  // Water in a closed basin runs down to its lake. The priority flood routed it
+  // across the basin to the spill point, which only a brimming lake reaches:
+  // left so, a river ending in a salt lake ran on past it to the rim, at full
+  // flow, and stopped dead there. Route such basins down to their lakes and run
+  // the water again.
+  if (!closedIn) {
+    let any = false;
+    for (let g = 0; g < groups && !any; g++) any = closedNow[g] === 1;
+    if (any) {
+      const r2 = rerouteClosed(mesh, routing, elev, ocean, pits, closedNow);
+      if (r2) return computeHydrology(mesh, elev, ocean, wb, precip, temp, slope, rough, radiusKm, r2, true, { closed: closedNow, lake });
+    }
   }
 
   // Drainage basins: each land cell is labelled by where its water leaves.
@@ -650,6 +765,7 @@ export function computeHydrology(
     flowMonths,
     meltShare,
     lake,
+    lakeWet,
     lakes,
     runoff: wb.runoffYear,
     drainage,

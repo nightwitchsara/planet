@@ -808,6 +808,25 @@ function buildNetworks(mesh: SphereMesh, inp: ChannelInputs, sh: Shared): Distri
 
   // ---- sea deltas
   const deltas = inp.deposits.deltas;
+  // Where each land cell's water reaches the sea: its river's last land cell
+  // (-1 for water that never does). A delta keeps to its own river's ground:
+  // another sizeable river reaching the sea elsewhere bounds it, so its
+  // channels never spread over a neighbouring basin and cross that river.
+  const outMouth = new Int32Array(n).fill(-1);
+  {
+    const { order, count } = inp.hydro.routing;
+    for (let i = 0; i < count; i++) {
+      const c = order[i];
+      if (ocean[c]) continue;
+      const r = receiver[c];
+      outMouth[c] = r < 0 ? -1 : ocean[r] ? c : outMouth[r];
+    }
+  }
+  /** Ground a delta of river L (bankfull q) may not spread over: another sizeable river's course. */
+  const barrierFor = (L: number, q: number): ((c: number) => boolean) => {
+    const qBar = Math.max(MIN_DELTA_Q, 0.15 * q);
+    return (c) => bankfull[c] >= qBar && outMouth[c] !== L && !ocean[c];
+  };
   // Delta plain cells belong to the nearest delta outlet across the plain.
   const owner = new Int32Array(n).fill(-1);
   const best = new Float64Array(n).fill(Infinity);
@@ -848,12 +867,17 @@ function buildNetworks(mesh: SphereMesh, inp: ChannelInputs, sh: Shared): Distri
       owner[d.river] = i;
       push(0, d.river);
     });
+    const qBarOf = deltas.map((d) => (d.river >= 0 ? Math.max(MIN_DELTA_Q, 0.15 * bankfull[d.river]) : Infinity));
     while (heap.length) {
       const [dist, c] = pop();
       if (dist > best[c]) continue;
+      const o = owner[c];
+      const Lo = deltas[o].river;
       for (let k = nbrStart[c], e = nbrStart[c + 1]; k < e; k++) {
         const m = nbr[k];
         if (ocean[m] || lake[m] >= 0 || kind[m] !== Deposit.Delta) continue;
+        // (Not across another sizeable river: the plain beyond is that river's.)
+        if (bankfull[m] >= qBarOf[o] && outMouth[m] !== Lo) continue;
         const dm = dist + nbrDist[k] * Rkm;
         if (dm < best[m] && dm < 700) {
           best[m] = dm;
@@ -934,20 +958,53 @@ function buildNetworks(mesh: SphereMesh, inp: ChannelInputs, sh: Shared): Distri
         wsum++;
       }
     }
-    const toward: [number, number, number] = wsum > 0 ? [tx / wsum, ty / wsum, tz / wsum] : at(M);
+    // (Mostly toward the river's own mouth: the delta grows around where the
+    // river reaches the sea, leaning a little toward the middle of its plain.)
+    const toward: [number, number, number] = wsum > 0 ? [0.75 * x[M] + (0.25 * tx) / wsum, 0.75 * y[M] + (0.25 * ty) / wsum, 0.75 * z[M] + (0.25 * tz) / wsum] : at(M);
     const fr = new Frame(apex, toward, Rkm);
     const apexAt = nearestCell(mesh, apex[0], apex[1], apex[2], L);
-    // Where the coast lies now, bearing by bearing.
+    // Where the coast lies now, bearing by bearing. A bearing that meets
+    // another sizeable river before the sea is closed, like one that meets a
+    // headland: the delta keeps to its own river's ground.
     const spread = form === 'birdfoot' ? 0.75 : form === 'estuarine' ? 0.8 : form === 'cuspate' ? 1.1 : 1.0;
     const half = Math.min(1.45, spread + 0.35);
     const front = new Front(half, 24);
     const maxR = 3 * Math.sqrt(A) + 2 * spacingKm;
-    const land = (c: number): boolean => !ocean[c];
-    for (let j = 0; j < front.r.length; j++) front.r[j] = reach(fr, front.theta(j), maxR, apexAt, land);
+    const blocked = barrierFor(L, Q);
+    /** Bearings whose way to the sea crosses another sizeable river (or that meet no sea at all). */
+    const closedJ = new Uint8Array(front.r.length);
+    const reachSea = (j: number): number => {
+      const theta = front.theta(j);
+      const st = Math.max(0.5, spacingKm / 8);
+      let cell = apexAt;
+      let crossed = false;
+      for (let s = st; s <= maxR; s += st) {
+        fr.xyz(s * Math.cos(theta), s * Math.sin(theta), tmp, 0);
+        cell = nearestCell(mesh, tmp[0], tmp[1], tmp[2], cell);
+        if (ocean[cell]) {
+          closedJ[j] = crossed ? 1 : 0;
+          return s - 0.5 * st;
+        }
+        if (!crossed && blocked(cell)) crossed = true;
+      }
+      closedJ[j] = 1;
+      return maxR;
+    };
+    for (let j = 0; j < front.r.length; j++) front.r[j] = reachSea(j);
+    // The way the river arrives at the apex, in the frame (bearing 0 = the axis).
+    let psiIn = 0;
+    {
+      const up = sh.mainDonor[apexCell];
+      if (up >= 0) {
+        const [uu, vu] = fr.uv(x[up], y[up], z[up]);
+        const [ua, va] = fr.uv(x[apexCell], y[apexCell], z[apexCell]);
+        if (Math.hypot(ua - uu, va - vu) > 1e-6) psiIn = Math.max(-1.1, Math.min(1.1, Math.atan2(va - vu, ua - uu)));
+      }
+    }
     // Bearings whose rays meet no sea (the coast curving away, a headland)
     // are closed: the delta spreads only over the open ones around its axis,
     // and its flanks keep to the coast at the open range's edges.
-    const reaches = (j: number): boolean => front.r[j] < maxR;
+    const reaches = (j: number): boolean => front.r[j] < maxR && closedJ[j] === 0;
     let jc = front.steps;
     if (!reaches(jc)) {
       jc = -1;
@@ -967,28 +1024,39 @@ function buildNetworks(mesh: SphereMesh, inp: ChannelInputs, sh: Shared): Distri
     let jhi = jc;
     while (jlo > 0 && isOpen(jlo - 1)) jlo--;
     while (jhi < front.r.length - 1 && isOpen(jhi + 1)) jhi++;
-    for (let j = 0; j < jlo; j++) front.r[j] = front.r[jlo];
-    for (let j = jhi + 1; j < front.r.length; j++) front.r[j] = front.r[jhi];
+    // (Closed bearings keep to the coast that is there, never past it.)
+    for (let j = 0; j < jlo; j++) front.r[j] = Math.min(front.r[j], front.r[jlo]);
+    for (let j = jhi + 1; j < front.r.length; j++) front.r[j] = Math.min(front.r[j], front.r[jhi]);
     smoothFront(front.r, 2);
     const thLo = front.theta(jlo);
     const thHi = front.theta(jhi);
+    // The built-out front meets the coast smoothly at the edges of the open
+    // bearings (no wedge with straight flanks), and is never a perfect curve:
+    // a few broad lobes and embayments of its own.
+    const edgeW = Math.max(0.06, 0.2 * (thHi - thLo));
+    const ease = (x: number): number => (x <= 0 ? 0 : x >= 1 ? 1 : x * x * (3 - 2 * x));
+    const ph1 = 2 * Math.PI * rng.next();
+    const ph2 = 2 * Math.PI * rng.next();
+    const ph3 = 2 * Math.PI * rng.next();
+    const wob = (t: number): number => 1 + 0.35 * (0.5 * Math.sin(5 * t + ph1) + 0.3 * Math.sin(11 * t + ph2) + 0.2 * Math.sin(23 * t + ph3));
     // Build out the front: a delta smaller than the cells progrades past the
     // drawn coast; one the mesh resolves already has its plain in the cells.
     const base = new Front(half, 24);
     const shape = (t: number): number => {
       const a = Math.abs(t) / spread;
       if (a >= 1 || t < thLo || t > thHi) return 0;
+      const taper = ease((t - thLo) / edgeW) * ease((thHi - t) / edgeW) * wob(t);
       switch (form) {
         case 'cuspate':
-          return (1 - a) ** 1.3;
+          return taper * (1 - a) ** 1.3;
         case 'arcuate':
-          return Math.sqrt(1 - a * a);
+          return taper * Math.sqrt(1 - a * a);
         case 'birdfoot':
-          return 0.5 * Math.cos((a * Math.PI) / 2);
+          return taper * 0.5 * Math.cos((a * Math.PI) / 2);
         case 'estuarine':
-          return Math.cos((a * Math.PI) / 2) ** 0.4;
+          return taper * Math.cos((a * Math.PI) / 2) ** 0.4;
         default:
-          return Math.cos((a * Math.PI) / 2) ** 0.7;
+          return taper * Math.cos((a * Math.PI) / 2) ** 0.7;
       }
     };
     // Plain area for a progradation P0: ∫ ((C + P0 s)² − C²)/2 dθ = a2 P0² + a1 P0.
@@ -1030,8 +1098,10 @@ function buildNetworks(mesh: SphereMesh, inp: ChannelInputs, sh: Shared): Distri
     const step = Math.max(0.2, Math.min(spacingKm / 4, R0 / 8));
     const tipOf = (theta: number, q: number): number => {
       const r = base.at(theta);
-      // Bird's-foot passes run out on their own levees, the biggest farthest.
-      if (form === 'birdfoot') return r + (R0 - r) * 0.4 + 0.6 * R0 * Math.sqrt(q / Q);
+      // Bird's-foot passes run out on their own levees, the biggest farthest
+      // (the Mississippi's reach some 20–30 km past its marsh, a tenth or so
+      // of the delta's size).
+      if (form === 'birdfoot') return r + 0.04 * R0 + 0.1 * R0 * Math.sqrt(q / Q);
       if (form === 'lobate') return r * (1 + 0.06 * Math.sqrt(q / Q));
       return r;
     };
@@ -1046,22 +1116,29 @@ function buildNetworks(mesh: SphereMesh, inp: ChannelInputs, sh: Shared): Distri
       const segment = first > 0 ? first : Math.max(4 * step, Math.min(0.4 * R0, (SPLIT_WIDTHS * W(q)) * (1 + 0.5 * rng.next())));
       let run = 0;
       for (let guard = 0; guard < 400 && !(split && now); guard++) {
-        // Steer toward the middle of its own bearings, wandering a little as
-        // it goes (channels are never ruled lines); just past a split it starts
-        // outside them, and turns in.
-        const d = centre - psi;
-        psi += Math.max(-0.12, Math.min(0.12, d)) * 0.2 + 0.12 * (rng.next() - 0.5);
         const lo = ta + margin;
         const hi = tb - margin;
-        const thHere = Math.atan2(v, u);
-        if (thHere < lo) psi += Math.min(0.2, 3 * (lo - thHere) + 0.04);
-        else if (thHere > hi) psi -= Math.min(0.2, 3 * (thHere - hi) + 0.04);
+        // The trunk eases round from the way its river arrives toward the
+        // middle of its bearings (no hairpin at the apex)...
+        const easing = from === 0 && run < trunkEase;
+        if (easing) {
+          psi += Math.max(-0.07, Math.min(0.07, centre - psi)) + 0.05 * (rng.next() - 0.5);
+        } else {
+          // ...and every channel steers toward the middle of its own bearings,
+          // wandering a little as it goes (channels are never ruled lines);
+          // just past a split it starts outside them, and turns in.
+          const d = centre - psi;
+          psi += Math.max(-0.12, Math.min(0.12, d)) * 0.2 + 0.12 * (rng.next() - 0.5);
+          const thHere = Math.atan2(v, u);
+          if (thHere < lo) psi += Math.min(0.2, 3 * (lo - thHere) + 0.04);
+          else if (thHere > hi) psi -= Math.min(0.2, 3 * (thHere - hi) + 0.04);
+        }
         let nu = u + step * Math.cos(psi);
         let nv = v + step * Math.sin(psi);
         // Kept to its bearings (within a little), so channels never cross.
         let th = Math.atan2(nv, nu);
         const tol = Math.min(0.1, 0.5 * (tb - ta));
-        if (th < lo - tol || th > hi + tol) {
+        if (!easing && (th < lo - tol || th > hi + tol)) {
           th = Math.max(lo - tol, Math.min(hi + tol, th));
           const rr = Math.hypot(nu, nv);
           nu = rr * Math.cos(th);
@@ -1103,8 +1180,9 @@ function buildNetworks(mesh: SphereMesh, inp: ChannelInputs, sh: Shared): Distri
     // for lobes and wave-built fronts, hardly at all where tides spread its
     // channels from the apex.
     const firstRun = (form === 'birdfoot' ? 0.5 : form === 'estuarine' ? 0.06 : form === 'lobate' ? 0.2 : 0.3) * R0;
-    if (N <= 1) grow(0, 0, ta, tb, Q, 99);
-    else grow(0, 0, ta, tb, Q, 0, false, Math.max(2 * step, firstRun));
+    const trunkEase = Math.max(3 * step, 0.3 * R0);
+    if (N <= 1) grow(0, psiIn, ta, tb, Q, 99);
+    else grow(0, psiIn, ta, tb, Q, 0, false, Math.max(2 * step, firstRun));
 
     // Every mouth must reach the sea: a little farther out at most.
     const push = Math.max(3 * step, 0.25 * R0);
@@ -1178,8 +1256,10 @@ function buildNetworks(mesh: SphereMesh, inp: ChannelInputs, sh: Shared): Distri
           const g = Math.exp(-((dth / ((6 * m.w + 0.05 * R0) / Math.max(m.r, 1e-3))) ** 2));
           r = Math.max(r, r + (m.r - r) * g);
         } else if (form === 'estuarine') {
-          const g = Math.exp(-((dth / ((4 * m.w + 0.03 * R0) / Math.max(m.r, 1e-3))) ** 2));
-          r -= 0.25 * R0 * d.tide * g;
+          // (Each funnel its own size: no row of matching scallops.)
+          const hm = Math.abs(Math.sin(m.th * 91.7 + m.r * 0.37) * 43758.5453) % 1;
+          const g = Math.exp(-((dth / (((2.5 + 4 * hm) * m.w + 0.03 * R0) / Math.max(m.r, 1e-3))) ** 2));
+          r -= (0.1 + 0.25 * hm) * R0 * d.tide * g;
         } else {
           // Arcs and cusps: the front reaches out to each mouth.
           const g = Math.exp(-((dth / ((5 * m.w + 0.05 * R0) / Math.max(m.r, 1e-3))) ** 2));
@@ -1355,7 +1435,8 @@ function buildNetworks(mesh: SphereMesh, inp: ChannelInputs, sh: Shared): Distri
 
   function growFan(k: 'fan' | 'inland', cells: number[], id: number, entry: number, Q: number, A: number, rng: Rng): Distributaries | null {
     const u = sh.mainDonor[entry];
-    const apex = u >= 0 ? mid(u, entry, 0.5) : at(entry);
+    // (At the entry cell itself, where the river's own course hands over.)
+    const apex = at(entry);
     // Down the trunk's course: where it leaves the patch.
     let last = entry;
     for (let g = 0; g < 10000; g++) {
@@ -1380,6 +1461,13 @@ function buildNetworks(mesh: SphereMesh, inp: ChannelInputs, sh: Shared): Distri
     }
     smoothFront(front.r, 1);
     const R0 = Math.max(front.at(0), 0.5);
+    // A river that runs on leaves where the patch ends: its trunk goes there,
+    // no farther (else it would overshoot and double back to the river).
+    let exitR = Infinity;
+    if (runsOn) {
+      const [ue, ve] = fr.uv(x[after], y[after], z[after]);
+      exitR = Math.max(0.5, Math.hypot(ue, ve));
+    }
     const N = Math.max(2, Math.min(k === 'fan' ? 6 : 9, Math.round(2 + Math.log2(1 + A / 40)), Math.floor(Q / 4)));
     const tree = new Tree();
     tree.add(0, 0, -1, Q);
@@ -1398,30 +1486,45 @@ function buildNetworks(mesh: SphereMesh, inp: ChannelInputs, sh: Shared): Distri
     let qTrunk = Q;
     const order = bearings.map((th, b) => ({ th, b })).filter((o) => o.b > 0);
     const legs = Math.max(1, order.length);
+    // The trunk wanders gently down the fan (never a ruled line), pulled back
+    // toward its axis.
+    let tPsi = 0;
     for (let s = 0; s <= legs; s++) {
       // Trunk leg.
       // (Branches leave near the apex, so the channels radiate over the cone.)
-      const goal = s === legs ? front.at(0) : R0 * (0.05 + (0.2 * (s + 1)) / (legs + 1));
-      const r0 = Math.hypot(tree.u[trunk], tree.v[trunk]);
-      for (let r = r0 + step; r < goal; r += step) trunk = tree.add(r, 0, trunk, qTrunk);
+      const rT = Math.min(R0, exitR);
+      const goal = s === legs ? Math.min(front.at(0), exitR) : rT * (0.05 + (0.2 * (s + 1)) / (legs + 1));
+      for (let g = 0; g < 400; g++) {
+        const tu = tree.u[trunk];
+        const tv = tree.v[trunk];
+        if (Math.hypot(tu, tv) + step >= goal) break;
+        tPsi += 0.16 * (rng.next() - 0.5) - 0.2 * tPsi - 0.5 * Math.atan2(tv, Math.max(tu, 1e-6));
+        tPsi = Math.max(-0.5, Math.min(0.5, tPsi));
+        trunk = tree.add(tu + step * Math.cos(tPsi), tv + step * Math.sin(tPsi), trunk, qTrunk);
+      }
       if (s === legs) {
-        trunk = tree.add(Math.max(goal, r0 + 0.5 * step), 0, trunk, qTrunk, runsOn ? 0 : 1);
+        const tu = tree.u[trunk];
+        const tv = tree.v[trunk];
+        const rr = Math.max(goal, Math.hypot(tu, tv) + 0.5 * step);
+        const th = Math.atan2(tv, Math.max(tu, 1e-6));
+        trunk = tree.add(rr * Math.cos(th), rr * Math.sin(th), trunk, qTrunk, runsOn ? 0 : 1);
         if (runsOn) exit = trunk;
         break;
       }
-      // A branch off to one side.
+      // A wash off to one side: radiating over the cone and dying away short
+      // of its toe as its water sinks into the gravel.
       const o = order[s];
       const q = Q * shares[o.b];
       qTrunk -= q;
       let node = trunk;
-      const end = front.at(o.th);
+      const end = front.at(o.th) * (0.6 + 0.35 * rng.next());
       let uu = tree.u[trunk];
       let vv = tree.v[trunk];
-      // Off the trunk at a sharp angle, then curving round toward its bearing.
-      let psi = (o.th > 0 ? 1 : -1) * (0.6 + 0.3 * rng.next());
+      // Off the trunk at a modest angle, then curving round toward its bearing.
+      let psi = (o.th > 0 ? 1 : -1) * (0.35 + 0.3 * rng.next());
       for (let g = 0; g < 200; g++) {
         const th = Math.atan2(vv, uu);
-        psi += Math.max(-0.2, Math.min(0.2, o.th + 0.5 * (o.th - th) - psi)) + 0.14 * (rng.next() - 0.5);
+        psi += Math.max(-0.12, Math.min(0.12, o.th + 0.5 * (o.th - th) - psi)) + 0.12 * (rng.next() - 0.5);
         uu += step * Math.cos(psi);
         vv += step * Math.sin(psi);
         if (Math.hypot(uu, vv) >= end || g === 199) {

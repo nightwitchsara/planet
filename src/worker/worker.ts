@@ -288,6 +288,61 @@ function regimeOf(w: World, c: number): string | null {
   return `Perennial, ${source}; ${swing < 2.5 ? 'steady through the year' : `high water in ${MONTH_NAMES[hi]}, lowest in ${MONTH_NAMES[lo]}`}`;
 }
 
+/**
+ * A sea delta whose plain the drawn map builds out over the sea at point v
+ * (where the cells are still ocean), and how far out from its apex toward its
+ * shoreline the point lies (0–1).
+ */
+function builtDeltaAt(w: World, v: [number, number, number]): { net: Distributaries; rho: number } | null {
+  const ch = w.channels;
+  if (!ch) return null;
+  const R = w.params.radiusKm;
+  for (const net of ch.networks) {
+    if (net.kind !== 'delta' || net.outline.length < 9) continue;
+    const ax = net.x[0];
+    const ay = net.y[0];
+    const az = net.z[0];
+    const dot = v[0] * ax + v[1] * ay + v[2] * az;
+    if (dot <= 0 || Math.acos(Math.min(1, dot)) * R > 2.5 * net.radiusKm + 20) continue;
+    // Gnomonic frame at the apex, its axis toward the outline's middle.
+    const ol = net.outline;
+    const K = ol.length / 3;
+    const mid = 3 * Math.floor(K / 2);
+    const dm = ol[mid] * ax + ol[mid + 1] * ay + ol[mid + 2] * az;
+    let ex = ol[mid] - dm * ax;
+    let ey = ol[mid + 1] - dm * ay;
+    let ez = ol[mid + 2] - dm * az;
+    const el = Math.hypot(ex, ey, ez) || 1;
+    ex /= el;
+    ey /= el;
+    ez /= el;
+    const fx = ay * ez - az * ey;
+    const fy = az * ex - ax * ez;
+    const fz = ax * ey - ay * ex;
+    const polar = (px: number, py: number, pz: number): [number, number] => {
+      const d = px * ax + py * ay + pz * az;
+      const u = (px * ex + py * ey + pz * ez) / d;
+      const s = (px * fx + py * fy + pz * fz) / d;
+      return [Math.atan2(s, u), Math.hypot(u, s)];
+    };
+    const [th, r] = polar(v[0], v[1], v[2]);
+    let prev = polar(ol[0], ol[1], ol[2]);
+    for (let k = 1; k < K; k++) {
+      const cur = polar(ol[3 * k], ol[3 * k + 1], ol[3 * k + 2]);
+      const lo = Math.min(prev[0], cur[0]);
+      const hi = Math.max(prev[0], cur[0]);
+      if (th >= lo && th <= hi && hi > lo) {
+        const f = (th - prev[0]) / (cur[0] - prev[0]);
+        const rOut = prev[1] + (cur[1] - prev[1]) * f;
+        if (r < rOut) return { net, rho: r / Math.max(rOut, 1e-12) };
+        break;
+      }
+      prev = cur;
+    }
+  }
+  return null;
+}
+
 /** The delta, fan or inland delta whose plain covers cell c, if any. */
 function networkAt(w: World, c: number): Distributaries | null {
   const ch = w.channels;
@@ -370,10 +425,15 @@ function inspect(w: World, lat: number, lon: number): InspectInfo {
   const vel = plateVelocityAt(w, g.plate[c], v);
   const speed = Math.hypot(vel.vE, vel.vN);
   const dir = compassName((Math.atan2(vel.vE, vel.vN) / DEG + 360) % 360);
-  const { setting, boundary } = describeSetting(w, c);
+  const described = describeSetting(w, c);
+  const { boundary } = described;
+  let { setting } = described;
   const h = w.hydro;
   const lk = h.lake[c] >= 0 ? h.lakes[h.lake[c]] : null;
-  const water = w.ocean[c] ? 'ocean' : lk ? (lk.kind === LakeKind.Fresh ? 'lake' : lk.kind === LakeKind.Saline ? 'salt lake' : 'salt flat') : null;
+  // Delta land the map builds out past the cells' coast is land, not sea.
+  const built = w.ocean[c] ? builtDeltaAt(w, v) : null;
+  if (built) setting = `Delta plain built out into the sea, a few metres above it — ${describeNetwork(built.net)}`;
+  const water = w.ocean[c] && !built ? 'ocean' : lk ? (lk.kind === LakeKind.Fresh ? 'lake' : lk.kind === LakeKind.Saline ? 'salt lake' : 'salt flat') : null;
   const lake = lk
     ? {
         description:
@@ -397,7 +457,7 @@ function inspect(w: World, lat: number, lon: number): InspectInfo {
   return {
     lat,
     lon,
-    elevation: w.elev[c],
+    elevation: built ? Math.round(0.5 + 1.8 * (1 - built.rho) ** 2) : w.elev[c],
     water,
     plate: { id: g.plate[c], name: g.plates[g.plate[c]].name, speed, dir },
     crust: { continental: g.ctype[c] === 1, thickness: g.thick[c], age: g.age[c] },

@@ -441,6 +441,105 @@ check(Math.max(...seams) <= 1, `tiles are seamless (max channel difference ${sea
   check(joins > 0 && wrong === 0, `${joins} tributaries reach their trunks with only their own flow`);
 }
 
+// Lakes. A closed basin's rivers end in its lake, which evaporates about what
+// they bring (none runs on past the lake to the basin's rim and stops dead
+// there), and a lake draws as one body that its rivers' mouths and its outlet
+// all reach.
+{
+  const worlds = [sharedWorld('selftest', 320000), sharedWorld('aurelia', 40000), sharedWorld('vale-fen-46', 40000)];
+  let dead = 0;
+  let closedN = 0;
+  let lo = Infinity;
+  let hi = 0;
+  for (const w of worlds) {
+    const { fine, hydro, ocean } = w;
+    const rec = hydro.routing.receiver;
+    for (let c = 0; c < fine.n; c++) {
+      const rc = rec[c];
+      // (A closed hollow too wet for a salt flat and too dry for a lake ends its rivers in a marsh.)
+      if (ocean[c] || hydro.lake[c] >= 0 || hydro.discharge[c] < 50 || rc < 0 || ocean[rc] || hydro.lake[rc] >= 0 || !hydro.endorheic[rc] || hydro.wetland[rc]) continue;
+      if (hydro.discharge[rc] < 0.5 * hydro.discharge[c]) dead++;
+    }
+    // Open-water evaporation less rain, and the runoff of the ground it drowns (m³/s).
+    const toM3s = (w.params.radiusKm ** 2 * 1e6) / (365.25 * 86400 * 1000);
+    const lost = new Float64Array(hydro.lakes.length);
+    for (let c = 0; c < fine.n; c++) {
+      const L = hydro.lake[c];
+      if (L >= 0) lost[L] += (1.1 * w.water.petYear[c] - w.precipYear[c] + w.water.runoffYear[c]) * fine.area[c] * toM3s * hydro.lakeWet[c];
+    }
+    hydro.lakes.forEach((l, L) => {
+      if (l.kind === 2 || l.outflow > 0 || l.inflow < 200) return;
+      closedN++;
+      lo = Math.min(lo, lost[L] / l.inflow);
+      hi = Math.max(hi, lost[L] / l.inflow);
+    });
+  }
+  check(
+    dead === 0 && closedN > 0 && lo > 0.6 && hi < 1.05,
+    `rivers end in their closed basins' lakes (${dead} stop dead on the way); ${closedN} closed lakes evaporate ${(100 * lo).toFixed(0)}–${(100 * hi).toFixed(0)}% of their inflow`,
+  );
+
+  // Drawn: the largest lakes, each wide enough to see; their water (the bed
+  // under the surface) reached from the lowest point, pixel to pixel.
+  const w = worlds[0];
+  const { fine } = w;
+  const lctx = { mesh: meshData(fine, 'lakes'), fields: buildFields(w, 'lakes', 1) };
+  const f = lctx.fields;
+  const thr = w.params.riverThreshold / 128;
+  const big = w.hydro.lakes
+    .map((l, i) => ({ l, i }))
+    .filter(({ l }) => l.kind !== 2 && l.areaKm2 > 1500)
+    .sort((a, b) => b.l.areaKm2 - a.l.areaKm2)
+    .slice(0, 8);
+  let ends = 0;
+  let reached = 0;
+  for (const { l, i } of big) {
+    let low = -1;
+    const mouths: number[] = [];
+    for (let c = 0; c < fine.n; c++) {
+      if (f.lake[c] === i && (low < 0 || w.elev[c] < w.elev[low])) low = c;
+      const r = w.hydro.routing.receiver[c];
+      if (f.lake[c] < 0 && !f.ocean[c] && r >= 0 && f.lake[r] === i && w.hydro.discharge[c] >= thr) mouths.push(r);
+    }
+    if (l.outflow > 0) mouths.push(l.outlet);
+    const across = 2 * Math.sqrt(l.areaKm2 / Math.PI);
+    const L = Math.max(3, Math.min(9, Math.round(Math.log2((2 * Math.PI * w.params.radiusKm * 160) / (256 * across)))));
+    const W = 512;
+    const toX = (c: number): number => ((fine.lon[c] + Math.PI) / (2 * Math.PI)) * levelWidth(L);
+    const toY = (c: number): number => ((Math.PI / 2 - fine.lat[c]) / Math.PI) * levelHeight(L);
+    const x0 = Math.round(toX(low) - W / 2);
+    const y0 = Math.max(0, Math.round(toY(low) - W / 2));
+    const { elevation } = renderWindow(lctx, { layer: 'terrain', month: -1, rivers: true }, { level: L, x0, y0, w: W, h: W }, true);
+    const level = f.lakeLevel[i];
+    const seen = new Uint8Array(W * W);
+    const pix = (c: number): number => {
+      const x = Math.round(toX(c) - x0);
+      const y = Math.round(toY(c) - y0);
+      return x >= 0 && x < W && y >= 0 && y < W ? y * W + x : -1;
+    };
+    const start = pix(low);
+    if (start < 0 || elevation![start] >= level - 0.5) continue;
+    const stack = [start];
+    seen[start] = 1;
+    while (stack.length > 0) {
+      const k = stack.pop()!;
+      const x = k % W;
+      for (const q of [x > 0 ? k - 1 : -1, x < W - 1 ? k + 1 : -1, k - W, k + W]) {
+        if (q < 0 || q >= W * W || seen[q] || elevation![q] >= level - 0.5) continue;
+        seen[q] = 1;
+        stack.push(q);
+      }
+    }
+    for (const c of mouths) {
+      const k = pix(c);
+      if (k < 0) continue;
+      ends++;
+      if (seen[k]) reached++;
+    }
+  }
+  check(ends > 0 && reached === ends, `the ${big.length} largest lakes draw as one body: ${reached} of ${ends} river mouths and outlets reach it`);
+}
+
 // ---- River channels (channels.ts) ----
 // Patterns in Earth's proportions, the same at any mesh detail; distributary
 // networks that conserve water at every split and reach the sea.
@@ -767,6 +866,407 @@ check(Math.max(...seams) <= 1, `tiles are seamless (max channel difference ${sea
       `the largest deltas' main channels run over delta land from apex to mouth (${shares.map((s) => s.toFixed(0)).join(', ')}% of their length); rivers hand over to ${nNet} networks at their apexes`,
     );
   }
+
+  // Coasts shoal toward the shore: no trough dug along them, no step out at
+  // sea where a shoreface rule lets go.
+  {
+    const mesh = w.fine;
+    const coasts: number[] = [];
+    for (let c = 0; c < mesh.n; c += 53) {
+      if (!w.ocean[c] || w.elev[c] < -60) continue;
+      let land = false;
+      for (let k = mesh.nbrStart[c]; k < mesh.nbrStart[c + 1]; k++) if (!w.ocean[mesh.nbr[k]]) land = true;
+      if (land) coasts.push(c);
+    }
+    const Lc = 8;
+    const S = 384;
+    let windows = 0;
+    let deeper = 0;
+    const gaps: number[] = [];
+    for (let s = 0; s < 8 && coasts.length > 0; s++) {
+      const c = coasts[Math.floor(((s + 0.5) / 8) * coasts.length)];
+      const cx = Math.round(((mesh.lon[c] + Math.PI) / (2 * Math.PI)) * levelWidth(Lc));
+      const cy = Math.round(((Math.PI / 2 - mesh.lat[c]) / Math.PI) * levelHeight(Lc));
+      const E = renderWindow(rc, { layer: 'elevation', month: -1, rivers: false }, { level: Lc, x0: cx - S / 2, y0: Math.max(0, cy - S / 2), w: S, h: S }, true).elevation!;
+      // Distance from land (px), out to 24.
+      const dist = new Int16Array(S * S).fill(-1);
+      let queue: number[] = [];
+      for (let p = 0; p < S * S; p++) if (E[p] >= 0) {
+        dist[p] = 0;
+        queue.push(p);
+      }
+      for (let d = 1; d <= 24 && queue.length; d++) {
+        const next: number[] = [];
+        for (const p of queue) {
+          const px = p % S;
+          for (const q of [px > 0 ? p - 1 : -1, px < S - 1 ? p + 1 : -1, p - S, p + S]) {
+            if (q < 0 || q >= S * S || dist[q] >= 0) continue;
+            dist[q] = d;
+            next.push(q);
+          }
+        }
+        queue = next;
+      }
+      let n1 = 0;
+      let s1 = 0;
+      let n2 = 0;
+      let s2 = 0;
+      for (let p = 0; p < S * S; p++) {
+        if (dist[p] >= 2 && dist[p] <= 8) {
+          n1++;
+          s1 += E[p];
+        } else if (dist[p] >= 14 && dist[p] <= 22) {
+          n2++;
+          s2 += E[p];
+        }
+      }
+      if (n1 < 200 || n2 < 200) continue;
+      windows++;
+      const gap = s1 / n1 - s2 / n2;
+      gaps.push(gap);
+      if (gap < -3) deeper++;
+    }
+    check(windows >= 4 && deeper === 0, `coasts shoal toward the shore over ${windows} coastlines (inshore minus offshore depth ${gaps.map((g) => g.toFixed(0)).join(', ')} m; ${deeper} deeper inshore)`);
+  }
+
+  // Rivers run at or below the ground beside them, never along a ridge
+  // across a hollow of the relief.
+  {
+    const Lr = 9;
+    const S = 768;
+    const mPx = w.params.radiusKm * 1000 * (Math.PI / levelHeight(Lr));
+    const picks: number[] = [];
+    for (let ch = 0; ch < f.rivStart.length - 1; ch++) {
+      for (let k = f.rivStart[ch] + 3; k < f.rivStart[ch + 1] - 3; k += 9) {
+        const c = f.rivCell[k];
+        if (f.rivQ[k] >= 80 && !w.ocean[c] && w.hydro.lake[c] < 0 && f.amp[c] > 120 && f.rivNet[k] < 0) picks.push(k);
+      }
+    }
+    picks.sort((a, b) => f.amp[f.rivCell[b]] - f.amp[f.rivCell[a]]);
+    let tested = 0;
+    let raised = 0;
+    for (const k of picks.filter((_, i) => i % Math.max(1, Math.floor(picks.length / 10)) === 0).slice(0, 10)) {
+      const c0 = f.rivCell[k];
+      const cx = Math.round(((w.fine.lon[c0] + Math.PI) / (2 * Math.PI)) * levelWidth(Lr));
+      const cy = Math.round(((Math.PI / 2 - w.fine.lat[c0]) / Math.PI) * levelHeight(Lr));
+      const x0 = cx - S / 2;
+      const y0 = Math.max(0, cy - S / 2);
+      const E = renderWindow(rc, { layer: 'elevation', month: -1, rivers: false }, { level: Lr, x0, y0, w: S, h: S }, true).elevation!;
+      for (let ch = 0; ch < f.rivStart.length - 1; ch++) {
+        for (let j = f.rivStart[ch] + 1; j < f.rivStart[ch + 1] - 1; j++) {
+          const c = f.rivCell[j];
+          if (f.rivQ[j] < 40 || w.ocean[c] || w.hydro.lake[c] >= 0 || f.rivNet[j] >= 0) continue;
+          let lon = w.fine.lon[c];
+          lon += 2 * Math.PI * Math.round((w.fine.lon[c0] - lon) / (2 * Math.PI));
+          const px = Math.round(((lon + Math.PI) / (2 * Math.PI)) * levelWidth(Lr)) - x0;
+          const py = Math.round(((Math.PI / 2 - w.fine.lat[c]) / Math.PI) * levelHeight(Lr)) - y0;
+          // Out past the valley's flank: its half-width and half again.
+          const r = Math.round((1.6 * (1800 + 2400 * Math.log10(f.rivQ[j] / 40 + 1))) / mPx);
+          if (px < r || py < r || px >= S - r || py >= S - r) continue;
+          const ring: number[] = [];
+          for (let a = 0; a < 16; a++) ring.push(E[Math.round(py + r * Math.sin((a * Math.PI) / 8)) * S + Math.round(px + r * Math.cos((a * Math.PI) / 8))]);
+          ring.sort((u, v) => u - v);
+          tested++;
+          if (E[py * S + px] > ring[8] + 5) raised++;
+        }
+      }
+    }
+    check(tested >= 20 && raised <= 0.1 * tested, `rivers run below the ground beside them (${raised} of ${tested} nodes in rugged country above the median of their surroundings)`);
+  }
+
+  // Ponds on delta and wetland plains are lakes, not specks: none under a few
+  // pixels from afar.
+  {
+    const nets: number[] = [];
+    // (Warm, wet plains: in cold country the ice-scoured lowlands have countless small lakes of their own.)
+    for (let n = 0; n < f.netStart.length - 1; n++) if (f.netInfo[NET_INFO * n] !== 1 && f.netInfo[NET_INFO * n + 7] < 0.5 && f.netInfo[NET_INFO * n + 11] > 8) nets.push(n);
+    nets.sort((a, b) => f.netInfo[NET_INFO * b + 5] - f.netInfo[NET_INFO * a + 5]);
+    let specks = 0;
+    let ponds = 0;
+    let windows = 0;
+    for (const n of nets.slice(0, 4)) {
+      for (const Lp of [7, 8]) {
+        const g = f.netStart[n];
+        const lon = Math.atan2(f.netY[g], f.netX[g]);
+        const lat = Math.asin(f.netZ[g]);
+        const S = 320;
+        const cx = Math.round(((lon + Math.PI) / (2 * Math.PI)) * levelWidth(Lp));
+        const cy = Math.round(((Math.PI / 2 - lat) / Math.PI) * levelHeight(Lp));
+        const { rgba } = renderWindow(rc, { layer: 'terrain', month: -1, rivers: false }, { level: Lp, x0: cx - S / 2, y0: Math.max(0, cy - S / 2), w: S, h: S });
+        windows++;
+        const seen = new Uint8Array(S * S);
+        for (let p = 0; p < S * S; p++) {
+          if (seen[p] || !isWater(rgba[4 * p], rgba[4 * p + 1], rgba[4 * p + 2])) continue;
+          let size = 0;
+          const stack = [p];
+          const comp: number[] = [];
+          seen[p] = 1;
+          while (stack.length && size < 12) {
+            const q = stack.pop()!;
+            size++;
+            comp.push(q);
+            const qx = q % S;
+            for (const r of [qx > 0 ? q - 1 : -1, qx < S - 1 ? q + 1 : -1, q - S, q + S]) {
+              if (r < 0 || r >= S * S || seen[r] || !isWater(rgba[4 * r], rgba[4 * r + 1], rgba[4 * r + 2])) continue;
+              seen[r] = 1;
+              stack.push(r);
+            }
+          }
+          if (size > 3) {
+            ponds++;
+            continue;
+          }
+          // (A speck stands alone: bits of a ragged shore lie beside their water.)
+          const px0 = p % S;
+          const py0 = Math.floor(p / S);
+          let alone = true;
+          for (let dy = -3; dy <= 3 && alone; dy++) {
+            for (let dx = -3; dx <= 3; dx++) {
+              const qx = px0 + dx;
+              const qy = py0 + dy;
+              if (qx < 0 || qy < 0 || qx >= S || qy >= S) continue;
+              const q = qy * S + qx;
+              if (!comp.includes(q) && isWater(rgba[4 * q], rgba[4 * q + 1], rgba[4 * q + 2])) {
+                alone = false;
+                break;
+              }
+            }
+          }
+          if (alone) specks++;
+        }
+      }
+    }
+    check(windows > 0 && specks <= 2 * windows, `delta and wetland ponds read as lakes from afar (${specks} specks of 3 px or less, ${ponds} larger waters over ${windows} views)`);
+  }
+
+  // Deltas keep to their own river's ground: no distributary crosses another
+  // sizeable river reaching the sea elsewhere, and the river runs on into its
+  // delta's main channel with no hairpin at the apex.
+  {
+    const mesh = w.fine;
+    const { receiver, order, count } = w.hydro.routing;
+    const outM = new Int32Array(mesh.n).fill(-1);
+    for (let i = 0; i < count; i++) {
+      const c = order[i];
+      if (w.ocean[c]) continue;
+      const r = receiver[c];
+      outM[c] = r < 0 ? -1 : w.ocean[r] ? c : outM[r];
+    }
+    let edges = 0;
+    let crossing = 0;
+    for (const net of w.channels.networks) {
+      if (net.kind !== 'delta' || net.delta < 0) continue;
+      const L = w.deposits.deltas[net.delta].river;
+      const qBar = Math.max(150, 0.15 * w.hydro.bankfull[L]);
+      let cell = L;
+      for (let j = 1; j < net.parent.length; j++) {
+        const p = net.parent[j];
+        edges++;
+        for (let t = 0.25; t < 1; t += 0.25) {
+          const vx = net.x[p] + (net.x[j] - net.x[p]) * t;
+          const vy = net.y[p] + (net.y[j] - net.y[p]) * t;
+          const vz = net.z[p] + (net.z[j] - net.z[p]) * t;
+          cell = nearestCell(mesh, vx, vy, vz, cell);
+          if (!w.ocean[cell] && w.hydro.bankfull[cell] >= qBar && outM[cell] !== L) {
+            crossing++;
+            break;
+          }
+        }
+      }
+    }
+    let turns = 0;
+    let sharp = 0;
+    for (let n = 0; n < f.netStart.length - 1; n++) {
+      if (f.netInfo[NET_INFO * n] !== 0 || Number.isNaN(f.netUp[3 * n])) continue;
+      const g0 = f.netStart[n];
+      const R0 = f.netInfo[NET_INFO * n + 5];
+      let gm = g0;
+      for (let guard = 0; guard < 400; guard++) {
+        const nx = f.netNext[gm];
+        if (nx < 0) break;
+        gm = nx;
+        if (Math.acos(Math.min(1, f.netX[gm] * f.netX[g0] + f.netY[gm] * f.netY[g0] + f.netZ[gm] * f.netZ[g0])) > 0.12 * R0) break;
+      }
+      if (gm === g0) continue;
+      const ix = f.netX[g0] - f.netUp[3 * n];
+      const iy = f.netY[g0] - f.netUp[3 * n + 1];
+      const iz = f.netZ[g0] - f.netUp[3 * n + 2];
+      const ox = f.netX[gm] - f.netX[g0];
+      const oy = f.netY[gm] - f.netY[g0];
+      const oz = f.netZ[gm] - f.netZ[g0];
+      const cosA = (ix * ox + iy * oy + iz * oz) / (Math.hypot(ix, iy, iz) * Math.hypot(ox, oy, oz) || 1);
+      turns++;
+      if (cosA < Math.cos((100 * Math.PI) / 180)) sharp++;
+    }
+    check(
+      edges > 0 && crossing <= 0.01 * edges && turns > 0 && sharp <= 0.03 * turns,
+      `deltas keep to their own rivers' ground (${crossing} of ${edges} distributaries cross another river) and rivers run on into their main channels (${sharp} of ${turns} turn back more than 100° at the apex)`,
+    );
+  }
+}
+
+// ---- Fjords, trough lakes and strandflats (render) ----
+// Glacial troughs drowned by the sea wind inland and branch up side valleys,
+// tile seamlessly, hold ribbon lakes their rivers run through (never drawn over
+// the water), and strandflat islets stand only off glaciated hard-rock coasts.
+{
+  const w = sharedWorld('selftest', 320000);
+  const rc = { mesh: meshData(w.fine, 'selftest-320k-fjord'), fields: buildFields(w, 'selftest-320k-fjord', 1) };
+  const f = rc.fields;
+  const { fine } = w;
+  const Rk = w.params.radiusKm;
+  const arc = (a: number, b: number): number => Math.acos(Math.min(1, fine.x[a] * fine.x[b] + fine.y[a] * fine.y[b] + fine.z[a] * fine.z[b])) * Rk;
+  const nCh = f.rivStart.length - 1;
+  let systems = 0;
+  let arms = 0;
+  let longest = 0;
+  const winding: number[] = [];
+  /** A mid-stem node of the longest fjord (for the seam test). */
+  let fjordNode = -1;
+  for (let ch = 0; ch < nCh; ch++) {
+    const last = f.rivStart[ch + 1] - 1;
+    if (f.rivFjord[last] < 0.5 || f.rivFjord[last - 1] < 0.5) continue;
+    let k = last;
+    let len = 0;
+    while (k > f.rivStart[ch] && f.rivFjord[k - 1] >= 0.5) {
+      len += arc(f.rivCell[k], f.rivCell[k - 1]);
+      k--;
+    }
+    if (!f.rivSea[ch]) {
+      if (len > 0) arms++;
+      continue;
+    }
+    systems++;
+    if (last - k >= 3) winding.push(len / Math.max(1, arc(f.rivCell[k], f.rivCell[last])));
+    if (len > longest) {
+      longest = len;
+      fjordNode = (k + last) >> 1;
+    }
+  }
+  winding.sort((a, b) => a - b);
+  const medWind = winding.length ? winding[winding.length >> 1] : 1;
+  check(
+    systems >= 20 && arms >= 5 && longest >= 60 && medWind >= 1.04,
+    `fjords: ${systems} drowned glacial troughs and ${arms} side arms off them, the longest ${Math.round(longest)} km, winding ${medWind.toFixed(2)}× their straight length (median)`,
+  );
+  // Seamless across tile edges on the longest fjord.
+  const seam = (layer: LayerId, level: number, c: number): number => {
+    const tx = Math.floor((((fine.lon[c] + Math.PI) / (2 * Math.PI)) * levelWidth(level)) / TILE);
+    const ty = Math.floor((((Math.PI / 2 - fine.lat[c]) / Math.PI) * levelHeight(level)) / TILE);
+    const opts = { layer, month: -1, rivers: true };
+    const big = renderWindow(rc, opts, { level, x0: tx * TILE - TILE, y0: Math.max(0, ty * TILE - TILE), w: 3 * TILE, h: 3 * TILE }).rgba;
+    let worst = 0;
+    for (const [ox, oy] of [[0, 0], [1, 0], [0, 1], [1, 1]]) {
+      const one = renderWindow(rc, opts, { level, x0: (tx - 1 + ox) * TILE + TILE / 2, y0: Math.max(0, ty * TILE - TILE) + oy * TILE + TILE / 2, w: TILE, h: TILE }).rgba;
+      for (let y = 0; y < TILE; y++) {
+        for (let x = 0; x < TILE; x++) {
+          const a = 4 * (y * TILE + x);
+          const b = 4 * ((oy * TILE + TILE / 2 + y) * 3 * TILE + ox * TILE + TILE / 2 + x);
+          for (let q = 0; q < 3; q++) worst = Math.max(worst, Math.abs(one[a + q] - big[b + q]));
+        }
+      }
+    }
+    return worst;
+  };
+  const seams = fjordNode >= 0 ? [seam('terrain', 8, f.rivCell[fjordNode]), seam('terrain', 10, f.rivCell[fjordNode])] : [99];
+  check(Math.max(...seams) <= 1, `fjords tile seamlessly (max channel difference ${seams.join(', ')} at levels 8 and 10)`);
+  // Ribbon lakes in troughs inland of the fjords: water a river runs through, never drawn over it.
+  const isLake = (r: number, g: number, b: number): boolean => {
+    const k = (156 - b) / 36;
+    return k >= -0.03 && k <= 1.03 && Math.abs(r - (70 - 30 * k)) <= 2 && Math.abs(g - (124 - 42 * k)) <= 2;
+  };
+  const inland: number[] = [];
+  for (let k = 0; k < f.rivCell.length; k++) {
+    const c = f.rivCell[k];
+    if (f.rivGlac[k] >= 300 && f.rivFjord[k] === 0 && f.rivQ[k] >= 40 && w.ice.thick[c] <= 0 && w.hydro.lake[c] < 0) inland.push(k);
+  }
+  inland.sort((a, b) => f.rivGlac[b] - f.rivGlac[a]);
+  let lakePx = 0;
+  let riverPx = 0;
+  let overLake = 0;
+  let windows = 0;
+  const Lt = 9;
+  const S = 384;
+  for (let i = 0; i < inland.length && windows < 6; i += Math.max(1, Math.floor(inland.length / 6))) {
+    const c = f.rivCell[inland[i]];
+    const cx = Math.round(((fine.lon[c] + Math.PI) / (2 * Math.PI)) * levelWidth(Lt));
+    const cy = Math.round(((Math.PI / 2 - fine.lat[c]) / Math.PI) * levelHeight(Lt));
+    const win = { level: Lt, x0: cx - S / 2, y0: Math.max(0, cy - S / 2), w: S, h: S };
+    const on = renderWindow(rc, { layer: 'terrain', month: -1, rivers: true }, win).rgba;
+    const off = renderWindow(rc, { layer: 'terrain', month: -1, rivers: false }, win).rgba;
+    windows++;
+    for (let p = 0; p < S * S; p++) {
+      const o = 4 * p;
+      const differs = on[o] !== off[o] || on[o + 1] !== off[o + 1] || on[o + 2] !== off[o + 2];
+      if (differs) riverPx++;
+      if (isLake(off[o], off[o + 1], off[o + 2])) {
+        lakePx++;
+        if (differs) overLake++;
+      }
+    }
+  }
+  check(
+    windows > 0 && lakePx > 200 && riverPx > 200 && overLake === 0,
+    `trough lakes: ${lakePx} px of lake water around ${windows} glacial troughs at level ${Lt}, their rivers drawn on ${riverPx} px and on ${overLake} px of the water`,
+  );
+  // Strandflats: only on glaciated hard-rock coasts, never on deltas or soft rock; islets off them.
+  let strandLand = 0;
+  let wrongCoast = 0;
+  for (let c = 0; c < fine.n; c++) {
+    if (w.ocean[c] || f.strand[c] <= 0) continue;
+    strandLand++;
+    const d = w.deposits.kind[c];
+    const r = w.lithology.rock[c];
+    if (d === Deposit.Delta || d === Deposit.Alluvium || r === Rock.Sandstone || r === Rock.Shale || (w.iceAge.erosion[c] <= 0 && w.iceAge.scour[c] < 0.4)) wrongCoast++;
+  }
+  /** Small islands (land components under 400 px) in a window centered off the coast at ocean cell c. */
+  const islets = (c: number, L: number): number => {
+    const W = 384;
+    const cx = Math.round(((fine.lon[c] + Math.PI) / (2 * Math.PI)) * levelWidth(L));
+    const cy = Math.round(((Math.PI / 2 - fine.lat[c]) / Math.PI) * levelHeight(L));
+    const { elevation } = renderWindow(rc, { layer: 'elevation', month: -1, rivers: false }, { level: L, x0: cx - W / 2, y0: Math.max(0, cy - W / 2), w: W, h: W }, true);
+    const E = elevation!;
+    const seen = new Uint8Array(W * W);
+    let n = 0;
+    const stack: number[] = [];
+    for (let p = 0; p < W * W; p++) {
+      if (seen[p] || E[p] < 0.5) continue;
+      let size = 0;
+      let edge = false;
+      stack.push(p);
+      seen[p] = 1;
+      while (stack.length) {
+        const q = stack.pop()!;
+        size++;
+        const x = q % W;
+        const y = (q - x) / W;
+        if (x === 0 || y === 0 || x === W - 1 || y === W - 1) edge = true;
+        for (const r of [q - 1, q + 1, q - W, q + W]) {
+          if (r < 0 || r >= W * W || seen[r] || E[r] < 0.5 || (r === q - 1 && x === 0) || (r === q + 1 && x === W - 1)) continue;
+          seen[r] = 1;
+          stack.push(r);
+        }
+      }
+      if (size < 400 && !edge) n++;
+    }
+    return n;
+  };
+  let flatSea = -1;
+  let plainSea = -1;
+  for (let c = 0; c < fine.n; c++) {
+    if (!w.ocean[c] || w.elev[c] < -150) continue;
+    let landNb = -1;
+    for (let k = fine.nbrStart[c]; k < fine.nbrStart[c + 1]; k++) if (!w.ocean[fine.nbr[k]]) landNb = fine.nbr[k];
+    if (landNb < 0) continue;
+    if (f.strand[c] > 0.8 && (flatSea < 0 || f.strand[c] > f.strand[flatSea])) flatSea = c;
+    if (f.strand[c] === 0 && f.fjord[landNb] === 0 && w.deposits.kind[landNb] === Deposit.Delta && plainSea < 0) plainSea = c;
+  }
+  const isl = flatSea >= 0 ? islets(flatSea, 9) : 0;
+  const islPlain = plainSea >= 0 ? islets(plainSea, 9) : 0;
+  check(
+    strandLand > 20 && wrongCoast === 0 && isl >= 20 && isl > 4 * islPlain,
+    `strandflats on ${strandLand} glaciated hard-rock coast cells (${wrongCoast} on deltas, soft rock or unglaciated ground): ${isl} islets off one at level 9, ${islPlain} off a delta coast`,
+  );
 }
 
 if (failures) {

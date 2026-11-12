@@ -7,7 +7,7 @@ import { DEPOSIT_COLORS } from '../world/sediment';
 import { SOIL_INFO } from '../world/soils';
 import { B_CONVERGENT, B_DIVERGENT, B_TRANSFORM } from '../world/tectonics/boundaries';
 import { Channel } from '../world/channels';
-import { CHANNEL_WIDTH, type FieldData, KERNEL_RADIUS, type MeshData, MIN_STREAM_FRACTION, NET_BINS, NET_INFO, type RenderContext } from './context';
+import { CHANNEL_WIDTH, type FieldData, KERNEL_RADIUS, type MeshData, MIN_STREAM_FRACTION, NET_BINS, NET_INFO, type RenderContext, TROUGH_Q } from './context';
 import * as pal from './palettes';
 
 export type LayerId =
@@ -251,6 +251,17 @@ let BANK = new Float32Array(0);
 let CARVE = new Float32Array(0);
 /** One stream's valley profile while it is rasterized, before it joins CARVE. */
 let STREAM = new Float32Array(0);
+/**
+ * The glacial trough of the valley that dominates each pixel (the one whose
+ * profile there is highest, CDOM): its depth (m) and 0–1 how far the sea fills
+ * it (a fjord, 0.5 at its head). STREAM_G/STREAM_F: the same for the stream
+ * being rasterized.
+ */
+let GLAC = new Float32Array(0);
+let FJW = new Float32Array(0);
+let CDOM = new Float32Array(0);
+let STREAM_G = new Float32Array(0);
+let STREAM_F = new Float32Array(0);
 /** Valley floors of rivers that flow most of the year (riparian vegetation). */
 let RIPARIAN = new Float32Array(0);
 /** Per-pixel surface flags (F_*). */
@@ -286,6 +297,8 @@ const F_ICE = 2;
 const F_SHELF = 4;
 /** Small lake in ice-scoured country (below the cell scale). */
 const F_SCOUR = 8;
+/** Ribbon lake in a glacial trough's basin (its river runs through, hidden under the water). */
+const F_TROUGH = 16;
 const AT = new Int32Array(4);
 
 function scratch(G: number): void {
@@ -303,6 +316,11 @@ function scratch(G: number): void {
   BANK = new Float32Array(G);
   CARVE = new Float32Array(G);
   STREAM = new Float32Array(G);
+  GLAC = new Float32Array(G);
+  FJW = new Float32Array(G);
+  CDOM = new Float32Array(G);
+  STREAM_G = new Float32Array(G);
+  STREAM_F = new Float32Array(G);
   RIPARIAN = new Float32Array(G);
   FLAGS = new Uint8Array(G);
   FLOOD = new Float32Array(G);
@@ -428,6 +446,7 @@ function subcellRelief(noise: Simplex3, px: number, py: number, pz: number, f0: 
   // Main crests rise to summits and dip to cols along their length; at one
   // height they would run on as unbroken walls (and as lines of rock through ice).
   const crest = M > 0.02 ? 0.6 + 0.45 * noise.noise(px * f0 * 1.7 - 47.1, py * f0 * 1.7 + 13.9, pz * f0 * 1.7 + 88.3) : 1;
+  let low = 0;
   for (let k = 0; k < octaves; k++) {
     let v = noise.noise(px * fr + 17.3 * k, py * fr - 9.1 * k, pz * fr + 5.7 * k);
     if (M > 0.02) {
@@ -437,26 +456,36 @@ function subcellRelief(noise: Simplex3, px: number, py: number, pz: number, f0: 
       v += (2.2 * (sig - 0.42) - v) * M;
     }
     s += a * v;
+    if (k < 2) low = s;
     a *= gain;
     fr *= 2;
   }
-  return (s * 0.5 * Math.sqrt(1 - gain * gain)) / 0.3;
+  const norm = (0.5 * Math.sqrt(1 - gain * gain)) / 0.3;
+  reliefLow = low * norm;
+  return s * norm;
 }
+
+/** The broad part of the last subcellRelief result (its two coarsest octaves, same units): the hills and hollows a valley crosses. */
+let reliefLow = 0;
 
 /** Surface elevation (m) and flags (F_ICE or 0) of the last landSurface call, and the depth of a trough lake over it (m, 0 if none). */
 let surfE = 0;
 let surfFlags = 0;
 let surfLake = 0;
+/** The level of the river whose valley the last landSurface point lies in (m): its valley floor. */
+let surfRiver = 0;
 
 /**
  * The surface where the land/sea field has land: ice where it covers the
  * ground, else rock and soil cut by the river valleys (cv: the valley profile,
- * 0–1) and, where ice-age glaciers reached the sea, by their troughs. Returns
- * false where that ground lies drowned below the sea after all: a fjord, or
- * the sounds between skerries off its mouth. A trough basin behind the sill
- * holds a lake instead (surfLake). Shared by the pixel loop and the river
- * courses, so rivers end where the drawn sea begins, fjords included. Sets
- * surfE, surfFlags and surfLake.
+ * 0–1) and, where ice-age glaciers ran, by their troughs (gd: the trough's
+ * depth here, m; fw: 0–1 how far the sea fills it, 0.5 at a fjord's head).
+ * Returns false where that ground lies drowned below the sea after all: a
+ * fjord, or the sounds between skerries on its sill. Up the valley from a
+ * fjord's head, and in troughs the sea never reached, overdeepened basins
+ * between rock bars hold ribbon lakes (surfLake). Shared by the pixel loop and
+ * the river courses, so rivers end where the drawn sea begins, fjords
+ * included. Sets surfE, surfFlags, surfLake and surfRiver.
  */
 function landSurface(
   noise: Simplex3,
@@ -472,31 +501,33 @@ function landSurface(
   iceH: number,
   cov: number,
   iceFull: number,
-  fj: number,
+  gd: number,
+  fw: number,
   lakeShare: number,
   seaShare: number,
   K: number,
 ): boolean {
-  /** Ragged ice margins (a third of a cell and finer) and fjord walls (~14 km and finer), finer still at deep zoom (K octaves of sub-cell detail). */
+  /** Ragged ice margins (a third of a cell and finer) and trough walls (~14 km and finer), finer still at deep zoom (K octaves of sub-cell detail). */
   const fIce = (2.3 * 0.75) / h;
   const fFjord = R / 14000;
   // The ground itself: the cell surface carries the ice's average thickness.
   const ground = S - (1 - ICE_ISOSTASY) * iceH;
-  // Where ice-age glaciers reached the sea, the valleys are troughs cut far
-  // deeper, whose walls wander: wider and narrower reaches, coves and spurs.
-  const nearSea = smooth01(seaShare / 0.1);
+  // Where ice-age glaciers ran, the valleys are troughs cut far deeper, whose
+  // walls wander: wider and narrower reaches, coves and spurs.
   let trough = 0;
   /** 0–1: how far into the trough's floor (rather than up its walls) this ground lies. */
   let floorShare = 0;
-  /** Down-valley noise (about −2…2, tens of km): basins between rock steps, and how far inland a fjord's sill lies. */
+  /** Down-valley noise (about −2…2, tens of km): basins between rock steps. */
   let steps = 0;
   /** The trough's full depth here (m). */
   let depth = 0;
-  /** Fractal noise (~14 km and finer) roughening the trough's walls, sill and lake ends. */
+  /** Fractal noise (~14 km and finer) roughening the trough's walls, a fjord's head and lake ends. */
   let jag = 0;
-  /** How far seaward (in nearSea units) the fjord's sill lies here. */
-  let sill = 0;
-  if (fj > 0.01 && cv > 0) {
+  /** 0–1: how far this ground lies in a fjord's drowned reach (its head ragged). */
+  let inFjord = 0;
+  /** The fjord weight with its head roughened (0.5 at the head). */
+  let fjJ = 0;
+  if (gd > 1 && cv > 0) {
     let a = 1;
     let fr = fFjord;
     for (let k = 0, nk = Math.max(4, Math.min(9, K - 3)); k < nk; k++) {
@@ -509,23 +540,15 @@ function landSurface(
     // pushed out into hollows and in along spurs of the ground around.
     const d = 1 - Math.cbrt(cv * cv);
     const dj = Math.min(1, Math.max(0, d + (3 * jag + 0.8 * Dn) * d * (1 - d)));
-    // The sill lies at varying distances inland, its line ragged and bowed
-    // seaward mid-trough like the end moraines that build many sills.
-    const fs = R / 2500;
-    sill = 0.15 * steps + 0.12 * jag + 0.12 * (1 - dj) ** 2 + 0.06 * noise.noise(px * fs - 21.3, py * fs + 8.8, pz * fs + 50.1);
-    /** 0 at the fjord's head, 1 toward its mouth. */
-    const down = smooth01((nearSea - 0.6 - sill) / 0.4);
+    fjJ = fw + 0.12 * jag;
+    inFjord = smooth01((fjJ - 0.45) / 0.1);
     // Ice carved it U-shaped, a broad floor between steep walls, so a drowned
     // trough keeps its width up to a blunt head instead of tapering to a point.
-    // It is wider where more ice flowed (where it cut deepest), and widens
-    // from its head toward the sea as the ice of more valleys joined it.
-    // Inland, away from the outlet glaciers, low gentle country was cut far
-    // less deep than mountains, and down the valley the floor steps over rock
-    // bars between deeper basins.
-    const width = 0.4 + 0.15 * Math.sqrt(fj) + 0.2 * down;
-    const inland = fj * Math.min(900, 200 + A);
-    depth = inland + (900 * fj - inland) * nearSea;
-    trough = depth * smooth01((width + 0.17 - dj) / 0.3) * (1 - 0.5 * smooth01((steps - 0.3) / 0.7));
+    // It is wider where more ice flowed (where it cut deepest), and down the
+    // valley the floor steps over rock bars between deeper basins.
+    const width = 0.4 + 0.2 * smooth01(gd / 900) + 0.08 * inFjord;
+    depth = gd;
+    trough = depth * smooth01((width + 0.17 - dj) / 0.3) * (1 - 0.45 * smooth01((steps - 0.3) / 0.7));
     floorShare = smooth01((width - dj) / 0.3);
   }
   let e0 = 0;
@@ -562,11 +585,17 @@ function landSurface(
       }
     }
   }
+  // The river runs below the broad hills and hollows of the sub-cell relief
+  // around it (reliefLow), never across a hollow on a ridge of its own: in a
+  // hollow its valley floor sinks with it.
+  const Al = A * (1 - lakeShare) ** 2;
+  surfRiver = ground - 4 - Al * Math.max(0.3, 0.25 - reliefLow) - trough;
   if (flags === 0) {
-    // V-shaped valley: deepest at the river, sub-cell relief smoothed only near
-    // its floor; lake beds are smoothed too, so shallow lakes keep clean shores.
-    const Al = A * (1 - lakeShare) ** 2;
-    e0 = ground + Al * Dn * (1 - cv * cv) - (0.3 * Al + 4) * cv - trough;
+    // V-shaped valley: the ground falls from the relief around it to the river,
+    // its hummocks smoothing out toward the floor; lake beds are smoothed too,
+    // so shallow lakes keep clean shores.
+    const nat = ground + Al * Dn - trough;
+    e0 = nat + (surfRiver - nat) * cv;
   }
   surfFlags = flags;
   surfLake = 0;
@@ -574,43 +603,49 @@ function landSurface(
     surfE = e0;
     return true;
   }
-  // A glacial trough drowned by the sea is a fjord reaching inland. The
-  // depth it takes grows smoothly away from the sea, the valley floor and
-  // fjord country, so fjords taper out instead of ending at a hard line. The
-  // sea reaches in only as far as the trough's sill, which lies at varying
-  // distances inland, and never into a lake's basin (that water is the lake's).
-  const fjT = smooth01(fj / 0.25);
-  const valley = Math.max(smooth01((cv - 0.1) / 0.3), floorShare);
   /** Where the valley holds one of the hydrology's own lakes (its water is that lake's). */
   const held = smooth01(lakeShare / 0.3);
-  const open = smooth01((nearSea - 0.5 - sill) / 0.25) * (1 - held);
   /** Surface of a lake in the trough here (m), if any. */
   let level = -Infinity;
+  /** 0–1: the sea fills the trough here. */
+  const sea = inFjord * (1 - held);
   if (depth > 0) {
-    // The floor shoals over the moraine sill at the fjord's mouth, where rocky
-    // knobs stand out of the water as skerries.
-    const mouth = floorShare * fjT * smooth01((seaShare - 0.3) / 0.15);
-    if (mouth > 0) {
-      if (e0 < -40) e0 += 0.8 * mouth * (-40 - e0);
-      const fs = R / 2500;
-      const knob = noise.noise(px * fs + 5.3, py * fs - 77.1, pz * fs + 31.7) + 0.5 * noise.noise(px * fs * 2.7 - 13.9, py * fs * 2.7 + 4.4, pz * fs * 2.7 - 61.2);
-      e0 += mouth * 90 * Math.max(0, knob - 0.25);
+    if (sea > 0) {
+      // A glacial trough drowned by the sea is a fjord. Its floor lies below
+      // the sea all along it, shoaling over rock bars but never out of the
+      // water (the fjord runs on unbroken to its head), deepest where the ice
+      // cut deepest.
+      const seaFloor = -(15 + 0.3 * depth);
+      if (e0 > seaFloor) e0 += (seaFloor - e0) * floorShare * sea;
+      // It shoals over the moraine sill at its mouth, where rocky knobs stand
+      // out of the water as skerries.
+      const mouth = floorShare * sea * smooth01((seaShare - 0.3) / 0.15);
+      if (mouth > 0) {
+        if (e0 < -40) e0 += 0.8 * mouth * (-40 - e0);
+        const fs = R / 2500;
+        const knob = noise.noise(px * fs + 5.3, py * fs - 77.1, pz * fs + 31.7) + 0.5 * noise.noise(px * fs * 2.7 - 13.9, py * fs * 2.7 + 4.4, pz * fs * 2.7 - 61.2);
+        e0 += mouth * 90 * Math.max(0, knob - 0.25);
+      }
     }
-    // Up the valley from the fjord's head the trough is no longer the sea's:
-    // a rock threshold closes it off, and further up rock bars part its
-    // overdeepened basins, each bar standing a little above the lakes the
-    // basins hold (they fill to their outlets, above sea level).
-    const lakeAt = Math.max(3, ground - (0.3 * A + 4) - 0.5 * depth);
-    const basin = smooth01((-0.1 - steps - 0.3 * jag) / 0.5);
-    const head = smooth01((open - 0.05) / 0.2) * (1 - smooth01((open - 0.6) / 0.15));
-    const hold = (1 - held) * Math.max(head, (1 - basin) * (1 - smooth01((open - 0.25) / 0.25)));
-    const crest = lakeAt + 4 + 0.15 * A * Math.max(0, Dn);
-    if (e0 < crest) e0 += hold * (crest - e0);
-    if (basin > 0 && open < 0.6 && held < 1) level = lakeAt;
+    // Up the valley from a fjord's head (and along troughs the sea never
+    // reached), rock bars part the overdeepened basins, each bar standing a
+    // little above the lake its basin holds (the lakes fill to their outlets,
+    // above the sea). Next to a fjord's head the valley floor is the river's
+    // flat (its delta), not yet a lake.
+    // (Near one of the hydrology's lakes the trough is that lake's cove instead.)
+    const dry = (1 - smooth01(lakeShare / 0.06)) * (1 - smooth01((fjJ - 0.12) / 0.2));
+    if (dry > 0) {
+      const lakeAt = Math.max(3, ground - (0.3 * A + 4) - 0.5 * depth);
+      const basin = smooth01((-0.55 - steps - 0.3 * jag) / 0.4);
+      const hold = dry * (1 - basin);
+      const crest = lakeAt + 4 + 0.15 * A * Math.max(0, Dn);
+      if (e0 < crest) e0 += hold * (crest - e0);
+      if (basin > 0 && dry > 0.5) level = lakeAt;
+    }
   }
   surfE = e0;
-  const drownAt = -600 * (1 - nearSea) - 400 * (1 - valley) - 400 * (1 - fjT) - 3000 * smooth01((0.62 - open) / 0.12);
-  if (seaShare > 0 && e0 < drownAt) return false;
+  // The fjord's water (the trough below the sea where the sea fills it).
+  if (sea > 0.5 && e0 < 0) return false;
   if (e0 < level) surfLake = level - e0;
   return true;
 }
@@ -631,6 +666,24 @@ function raggedEdge(noise: Simplex3, px: number, py: number, pz: number, f: numb
   return s;
 }
 
+/**
+ * Does a lake's water cover this point? Its own body: across its cells as far
+ * as they lie under the water (wet: their weighted share, 1 along the way the
+ * water crosses the lake from each river's mouth to the outlet), with a ragged
+ * shore, one body whatever the sub-cell hollows and rises beneath it. Beyond
+ * that, hollows of the shore that dip below its surface (coves and shore
+ * pools; share: the weight of its cells; ground: before any floodplain).
+ */
+function lakeAt(noise: Simplex3, px: number, py: number, pz: number, f0: number, K: number, wet: number, share: number, ground: number, level: number): boolean {
+  // (The ragged noise stays within about ±1.6: deep inside the body or far
+  // from it the answer needs none.)
+  if (wet > 0.82) return true;
+  if (wet < 0.18 && ground >= level) return false;
+  // (The body's shore wanders on a broader scale than the coves of the hollows.)
+  if (wet > 0.18 && wet + 0.2 * raggedEdge(noise, px, py, pz, f0 * 1.5, K) > 0.5) return true;
+  return ground < level && share + 0.3 * raggedEdge(noise, px, py, pz, f0 * 2.5, K) > 0.22;
+}
+
 /** Last triangle found by dryAt or cellChiAt (walk start for the next, nearby point). */
 let courseTri = 0;
 
@@ -639,7 +692,7 @@ let courseTri = 0;
  * octaves? The pixel loop's own decision (roughChi, then landSurface), taken
  * with the river's valley carved in (cv 1 on a carved river's line, else 0).
  */
-function dryAt(md: MeshData, f: FieldData, noise: Simplex3, K: number, cv: number, px: number, py: number, pz: number): boolean {
+function dryAt(md: MeshData, f: FieldData, noise: Simplex3, K: number, cv: number, px: number, py: number, pz: number, gd = 0, fw = 0): boolean {
   const t = (courseTri = locate(md, px, py, pz, courseTri));
   const { x, y, z, gStart, gCell } = md;
   const { elev, grad, amp, ocean, mtn, fjord, ice, iceCover, lake } = f;
@@ -687,7 +740,7 @@ function dryAt(md: MeshData, f: FieldData, noise: Simplex3, K: number, cv: numbe
   const f0 = 0.75 / h;
   if (swO > 0 && roughChi(noise, sChi / sw, M, sF / sw, px, py, pz, f0, K) <= 0) return false;
   const Dn = subcellRelief(noise, px, py, pz, f0, K, M);
-  return landSurface(noise, px, py, pz, h, f.radiusKm * 1000, sA / sw, Dn, cv, seL / swL, sIce / swL, sCov / swL, sCov > 0 ? sIce / sCov : 0, sF / sw, sLake / sw, swO / sw, K);
+  return landSurface(noise, px, py, pz, h, f.radiusKm * 1000, sA / sw, Dn, cv, seL / swL, sIce / swL, sCov / swL, sCov > 0 ? sIce / sCov : 0, cv > 0 ? gd : 0, fw, sLake / sw, swO / sw, K);
 }
 
 /** Most points on a segment's curve: 2.5 px apart along its axis, about 2 along a meandering channel (a coarse mesh's segment spans thousands of pixels at the deepest levels); a mouth's run-on may add as many. */
@@ -771,6 +824,29 @@ function omegaFor(sig: number): number {
  * cell's center, so it always meets the coastline. Fills CURVE_MP (curveN
  * points) and returns how many lie between the two nodes (0: degenerate).
  */
+/**
+ * Where a river ending at cell `c` (point v) meets a network instead: if `c`
+ * is one of a delta's, fan's or inland delta's own cells, its nearest node
+ * that is not a mouth (-1 if none).
+ */
+function netJoinNode(f: FieldData, c: number, vx: number, vy: number, vz: number, maxAng: number): number {
+  const n = c >= 0 ? f.cellNet[c] : -1;
+  if (n < 0) return -1;
+  let best = -1;
+  let bd = -2;
+  for (let g = f.netStart[n], e = f.netStart[n + 1]; g < e; g++) {
+    if (f.netMouth[g] === 1) continue;
+    const d = f.netX[g] * vx + f.netY[g] * vy + f.netZ[g] * vz;
+    if (d > bd) {
+      bd = d;
+      best = g;
+    }
+  }
+  // (Only one close by: a tributary joining the trunk where its course is
+  // hidden. Far from every channel it keeps its own end.)
+  return bd >= Math.cos(maxAng) ? best : -1;
+}
+
 function riverCurve(md: MeshData, f: FieldData, ch: number, i: number, dRad: number, x0g: number, y0g: number, lonShift: number): number {
   const { rivStart, rivCell, rivSea, rivNext, mtn } = f;
   const { x, y, z } = md;
@@ -797,9 +873,18 @@ function riverCurve(md: MeshData, f: FieldData, ch: number, i: number, dRad: num
   P[6] = x[b];
   P[7] = y[b];
   P[8] = z[b];
+  // A tributary joining a network's hidden course (or a river reaching the sea
+  // inside the land a delta built out) runs on into the network's nearest
+  // channel, not to where the trunk's own course was or the old coast.
+  const joinG = i + 1 === s1 - 1 && netIn < 0 ? netJoinNode(f, rivSea[ch] === 1 && i >= s0 ? a : b, x[b], y[b], z[b], 0.75 * md.spacing) : -1;
+  if (joinG >= 0) {
+    P[6] = f.netX[joinG];
+    P[7] = f.netY[joinG];
+    P[8] = f.netZ[joinG];
+  }
   for (let k = 0; k < 3; k++) {
     P[k] = gOut >= 0 ? (k === 0 ? f.netX[gOut] : k === 1 ? f.netY[gOut] : f.netZ[gOut]) : pa >= 0 ? (k === 0 ? x[pa] : k === 1 ? y[pa] : z[pa]) : 2 * P[3 + k] - P[6 + k];
-    P[9 + k] = gIn >= 0 ? (k === 0 ? f.netX[gIn] : k === 1 ? f.netY[gIn] : f.netZ[gIn]) : pb >= 0 ? (k === 0 ? x[pb] : k === 1 ? y[pb] : z[pb]) : 2 * P[6 + k] - P[3 + k];
+    P[9 + k] = joinG >= 0 ? 2 * P[6 + k] - P[3 + k] : gIn >= 0 ? (k === 0 ? f.netX[gIn] : k === 1 ? f.netY[gIn] : f.netZ[gIn]) : pb >= 0 ? (k === 0 ? x[pb] : k === 1 ? y[pb] : z[pb]) : 2 * P[6 + k] - P[3 + k];
   }
   const seaEnd = rivSea[ch] === 1 && i + 1 === s1 - 1;
   const lonRef = Math.atan2(y[a], x[a]) + lonShift;
@@ -894,7 +979,11 @@ function riverCurve(md: MeshData, f: FieldData, ch: number, i: number, dRad: num
   const kLo = Math.max(2, Math.ceil(waves / 12));
   const kHi = Math.min(Math.floor(waves / 3), 3 * kLo, Math.floor(lenPx / 4), CURVE_BELT.length);
   const kTop = Math.max(nh, kHi);
-  const flat = 1 - 0.6 * 0.5 * (mtn[a] + mtn[b]);
+  // Rivers wind less through young mountains, but glacial troughs (and the
+  // fjords drowning them) wind more: the ice followed old valleys and lines of
+  // weakness, turning where they turned.
+  const glacW = smooth01((f.rivGlac[i] + f.rivGlac[i + 1]) / 800);
+  const flat = 1 - 0.6 * 0.5 * (mtn[a] + mtn[b]) + (1.25 - (1 - 0.6 * 0.5 * (mtn[a] + mtn[b]))) * glacW;
   const nxp = -cdy / lenPx;
   const nyp = cdx / lenPx;
   const amps = CURVE_AMP;
@@ -1163,13 +1252,21 @@ function riverReach(md: MeshData, f: FieldData, L: number): LazyReach {
   const noise = noiseFor(f.noiseSeed);
   let cv = 0;
   let nMain = 0;
+  /** The segment being settled's glacial trough at its two nodes: depth and fjord weight. */
+  let ga = 0;
+  let gb = 0;
+  let wa = 0;
+  let wb = 0;
   // In the water drawn at this level, with the river's own valley carved in
-  // (which ends at the sea cell: only the river runs on to the drawn coast).
+  // (which ends at the sea cell: only the river runs on to the drawn coast),
+  // and its trough (a fjord's water, where the sea fills it).
   const wet = (s: number): boolean => {
     const lon = (CURVE_MP[2 * s] + 0.5) * dRad - Math.PI;
     const lat = Math.PI / 2 - (CURVE_MP[2 * s + 1] + 0.5) * dRad;
     const cl = Math.cos(lat);
-    return !dryAt(md, f, noise, K, s < nMain ? cv : 0, cl * Math.cos(lon), cl * Math.sin(lon), Math.sin(lat));
+    const u = Math.min(1, CURVE_V[s]);
+    const own = s < nMain ? cv : 0;
+    return !dryAt(md, f, noise, K, own, cl * Math.cos(lon), cl * Math.sin(lon), Math.sin(lat), ga + (gb - ga) * u, wa + (wb - wa) * u);
   };
   // First wet curve point: every point (2.5 px apart) while a cell spans few
   // pixels, so no strait goes unseen; deeper in every `stride`-th (water under
@@ -1197,9 +1294,14 @@ function riverReach(md: MeshData, f: FieldData, L: number): LazyReach {
     }
     const lost = Math.min(rivQ[i], above);
     wetDrop[i] = lost;
-    // Only drawn segments near the sea, or deep below it, can meet the water;
-    // a carved valley at a mouth may run on past its sea cell.
-    const drawn = rivQ[i + 1] - lost >= thrL && (rivCoast[i] || Math.min(elev[a], elev[b]) < -500);
+    // Only drawn segments near the sea, deep below it, or in a fjord's trough
+    // can meet the water; a carved valley at a mouth may run on past its sea cell.
+    ga = f.rivGlac[i];
+    gb = f.rivGlac[i + 1];
+    wa = f.rivFjord[i];
+    wb = f.rivFjord[i + 1];
+    const inFjord = carveOn && Math.max(wa, wb) > 0.3;
+    const drawn = rivQ[i + 1] - lost >= thrL && (rivCoast[i] || inFjord || Math.min(elev[a], elev[b]) < -500);
     const mouth = carveOn && rivSea[ch] === 1 && rivRun[ch] === 1 && i + 2 === rivStart[ch + 1] && rivQ[i + 1] >= thrL;
     if ((drawn || mouth) && (nMain = riverCurve(md, f, ch, i, dRad, 0, 0, 0)) > 0) {
       courseTri = seedTriangle(md, Math.PI / 2 - (CURVE_MP[1] + 0.5) * dRad, (CURVE_MP[0] + 0.5) * dRad - Math.PI);
@@ -1355,6 +1457,9 @@ function rasterRivers(md: MeshData, f: FieldData, L: number, x0g: number, y0g: n
   COVER.fill(0, 0, G);
   BANK.fill(0, 0, G);
   CARVE.fill(0, 0, G);
+  GLAC.fill(0, 0, G);
+  FJW.fill(0, 0, G);
+  CDOM.fill(0, 0, G);
   RIPARIAN.fill(0, 0, G);
   FLOOD.fill(0, 0, G);
   BELT.fill(0, 0, G);
@@ -1413,8 +1518,11 @@ function rasterRivers(md: MeshData, f: FieldData, L: number, x0g: number, y0g: n
     for (let i = s0; i < s1 - 1; i++) {
       // The river is drawn until it runs into the drawn water (sea, or a fjord's
       // drowned trough); its valley is carved all the way to the sea cell.
-      // (Water lost upstream only ever thins the drawn line.)
-      if (rivQ[i + 1] < thrL) continue;
+      // (Water lost upstream only ever thins the drawn line.) Glacial troughs
+      // are carved at every level, drawn river or not, so fjords and their
+      // lakes stay put as you zoom.
+      const trough = carve && rivQ[i + 1] >= TROUGH_Q && f.rivGlac[i] + f.rivGlac[i + 1] > 0;
+      if (rivQ[i + 1] < thrL && !trough) continue;
       // A delta's, fan's or inland delta's distributaries are drawn instead.
       if (f.rivNet[i] >= 0) continue;
       const b0 = rivBox[4 * i];
@@ -1446,7 +1554,7 @@ function rasterRivers(md: MeshData, f: FieldData, L: number, x0g: number, y0g: n
         reach.resolve(jn);
         const qT = rivQ[jn] - reach.wetDrop[jn];
         const trunkShown = draw && reach.wetCut[jn] !== 0 && rivQ[jn + 1] - reach.wetDrop[jn] >= thrL;
-        const trunkCarved = carve && rivQ[jn + 1] >= thrL;
+        const trunkCarved = carve && (rivQ[jn + 1] >= thrL || (rivQ[jn + 1] >= TROUGH_Q && f.rivGlac[jn] + f.rivGlac[jn + 1] > 0));
         if (trunkShown || trunkCarved) trunkCourse(md, f, chainOf[jn], jn, dRad, x0g, y0g, shift);
         if (trunkShown) {
           trunkW = riverHalfWidth(qT, bankOf(jn, qT), thr0, L, mPerPx);
@@ -1527,13 +1635,25 @@ function rasterRivers(md: MeshData, f: FieldData, L: number, x0g: number, y0g: n
           const step = Math.max(1, Math.round(V0 / 2.5));
           let px0 = ax[0];
           let py0 = ax[1];
+          // Its glacial trough: depth and fjord weight along the segment (on past the sea cell, the mouth's).
+          const ga = f.rivGlac[i];
+          const gb = f.rivGlac[i + 1];
+          const wa = f.rivFjord[i];
+          const wb = f.rivFjord[i + 1];
+          let g0 = ga;
+          let w0 = wa;
           for (let s = step; s < nCarve + step - 1; s += step) {
             const si = Math.min(nCarve - 1, s);
             // Within the trunk's valley a tributary's valley opens out into it.
             const V = trunkN >= 2 && trunkV > V0 ? V0 + (trunkV - V0) * smooth01(1 - TRUNK_DIST[si] / trunkV) : V0;
-            stampCarve(ax[2 * si], ax[2 * si + 1], px0, py0, V, wet, Wg, Hg);
+            const u = Math.min(1, CURVE_V[si]);
+            const g1 = ga + (gb - ga) * u;
+            const w1 = wa + (wb - wa) * u;
+            stampCarve(ax[2 * si], ax[2 * si + 1], px0, py0, V, wet, Wg, Hg, g1, g0, w1, w0);
             px0 = ax[2 * si];
             py0 = ax[2 * si + 1];
+            g0 = g1;
+            w0 = w1;
           }
           // Its floodplain (and active belt): a flat valley floor where it has room.
           if (Math.max(st.plain0, st.plain1, st.belt0, st.belt1) >= 1.5) stampFloodplain(st, nCarve, Wg, Hg);
@@ -2012,6 +2132,77 @@ function vnoise(slot: number, x: number, y: number, seed: number): number {
 }
 
 /** Integer hash of three integers to [0, 1). */
+/** Cache of pond grid cells' hashes (pondNear): key ri, rj, salt and seven hashes per slot. */
+const POND_SLOTS = 1024;
+const POND_KEY = new Int32Array(8 * POND_SLOTS).fill(-0x7fffffff);
+const POND_H = new Float64Array(8 * POND_SLOTS);
+
+/**
+ * The pond of a jittered grid (spacing sp radians, cj the pixel's row, spLon0–2
+ * the longitude spacings of the rows below, at and above it) nearest the
+ * pixel: each grid cell holds one with probability `density`, with a centre,
+ * a size (radius r0 + r1·h³ radians), an elongation and an axis from the hash
+ * (salt). Returns its shape distance (under 1 inside, lobed by the relief Dn)
+ * or 1; those under about a pixel and a half are left out whole.
+ */
+function pondNear(
+  lat: number,
+  lon: number,
+  cl: number,
+  sp: number,
+  cj: number,
+  spLon0: number,
+  spLon1: number,
+  spLon2: number,
+  salt: number,
+  density: number,
+  r0: number,
+  r1: number,
+  dRad: number,
+  Dn: number,
+): number {
+  let best = 1;
+  const reach = 2 * (r0 + r1);
+  for (let dj = -1; dj <= 1; dj++) {
+    const rj = cj + dj;
+    const spLon = dj < 0 ? spLon0 : dj > 0 ? spLon2 : spLon1;
+    const ci = Math.floor(lon / spLon);
+    for (let di = -1; di <= 1; di++) {
+      const ri = ci + di;
+      // (Each grid cell's hashes, cached: neighbouring pixels ask for the same few.)
+      const slot = 8 * ((Math.imul(ri, 73856093) ^ Math.imul(rj, 19349663) ^ salt) & (POND_SLOTS - 1));
+      if (POND_KEY[slot] !== ri || POND_KEY[slot + 1] !== rj || POND_KEY[slot + 2] !== salt) {
+        POND_KEY[slot] = ri;
+        POND_KEY[slot + 1] = rj;
+        POND_KEY[slot + 2] = salt;
+        for (let k = 1; k <= 7; k++) POND_H[slot + k] = ihash(ri, rj, salt + k);
+      }
+      if (POND_H[slot + 1] >= density) continue;
+      // (Its centre first: most are out of reach whatever their size.)
+      const cLat = (rj + 0.15 + 0.7 * POND_H[slot + 3]) * sp;
+      const dy = lat - cLat;
+      if (dy > reach || dy < -reach) continue;
+      let dLon = lon - (ri + 0.15 + 0.7 * POND_H[slot + 4]) * spLon;
+      dLon -= 2 * Math.PI * Math.round(dLon / (2 * Math.PI));
+      const dx = dLon * cl;
+      if (dx * dx + dy * dy > reach * reach) continue;
+      const hs = POND_H[slot + 2];
+      const rad = r0 + r1 * hs * hs * hs;
+      const aspect = 0.4 + 0.45 * POND_H[slot + 6];
+      if (rad * aspect < 1.2 * dRad) continue;
+      if (dx * dx + dy * dy > 4 * rad * rad) continue;
+      // (Its long axis: a direction from the hash, no trigonometry.)
+      const ca = 2 * POND_H[slot + 5] - 1;
+      const sa = (POND_H[slot + 7] < 0.5 ? -1 : 1) * Math.sqrt(1 - ca * ca);
+      const u = (dx * ca + dy * sa) / rad;
+      const v = (dy * ca - dx * sa) / (rad * aspect);
+      const rr = u * u + v * v + 0.35 * Dn;
+      if (rr < best) best = rr;
+    }
+  }
+  return best;
+}
+
 function ihash(a: number, b: number, c: number): number {
   let h = Math.imul(a ^ 0x5bd1e995, 0x85ebca6b) ^ Math.imul(b + 0x632be5ab, 0xc2b2ae35) ^ Math.imul(c ^ 0x27d4eb2f, 0x165667b1);
   h ^= h >>> 15;
@@ -2056,6 +2247,14 @@ let netBelt = 1;
  */
 function runBreak(i: number, j: number, key: number, pB: number): boolean {
   return ((i + Math.floor(4 * ihash(j, 7, key))) & 3) === 0 || ihash(i, j, key + 5) < pB;
+}
+
+/** Does the run holding cell (i, j), a run of the belt's outer rows, lie against the bank with no channel between? About one run in four. */
+function bankAttached(i: number, j: number, key: number, pB: number): boolean {
+  if (j !== 0 && j !== NET_ROWS - 1) return false;
+  let i0 = i;
+  for (let s = 0; s < 4 && !runBreak(i0, j, key, pB); s++) i0--;
+  return ihash(i0, j, key + 77) < 0.27;
 }
 
 function sameRun(i1: number, i2: number, j: number, key: number, pB: number): boolean {
@@ -2158,6 +2357,10 @@ function braidNet(noise: Simplex3, tau: number, nPx: number, h: number, pa: numb
     const outK = jk < 0 || jk >= NET_ROWS;
     // Cells of one run (or both beyond the belt) have no channel between them.
     if (outB || outK ? outB && outK : jk === bj && sameRun(bi, NP_I[k], bj, key, pB)) continue;
+    // Nor does a bar along the bank that lies against it (a whole run, so no
+    // channel is left hanging): the belt's margin wanders in and out instead
+    // of running as one unbroken channel down each bank.
+    if (outB !== outK && bankAttached(outB ? NP_I[k] : bi, outB ? jk : bj, key, pB)) continue;
     const ex = NP_X[k] - NP_X[best];
     const ey = NP_Y[k] - NP_Y[best];
     const el = Math.sqrt(ex * ex + ey * ey);
@@ -2509,8 +2712,12 @@ let streamY0 = 0;
 let streamX1 = -1;
 let streamY1 = -1;
 
-/** One stretch of a stream's valley profile into STREAM (the stream's own stretches overlap: max). */
-function stampCarve(x0: number, y0: number, x1: number, y1: number, V: number, wet: number, Wg: number, Hg: number): void {
+/**
+ * One stretch of a stream's valley profile into STREAM (the stream's own
+ * stretches overlap: max), with its glacial trough's depth and fjord weight
+ * (g0, w0 at the first point, g1, w1 at the second) where it is highest.
+ */
+function stampCarve(x0: number, y0: number, x1: number, y1: number, V: number, wet: number, Wg: number, Hg: number, g0 = 0, g1 = 0, w0 = 0, w1 = 0): void {
   const minX = Math.max(0, Math.floor(Math.min(x0, x1) - V));
   const maxX = Math.min(Wg - 1, Math.ceil(Math.max(x0, x1) + V));
   const minY = Math.max(0, Math.floor(Math.min(y0, y1) - V));
@@ -2542,7 +2749,11 @@ function stampCarve(x0: number, y0: number, x1: number, y1: number, V: number, w
       const d = Math.sqrt(d2) * iv;
       const c = (1 - d) * Math.sqrt(1 - d);
       const p = py * Wg + px;
-      if (c > STREAM[p]) STREAM[p] = c;
+      if (c > STREAM[p]) {
+        STREAM[p] = c;
+        STREAM_G[p] = g0 + (g1 - g0) * t;
+        STREAM_F[p] = w0 + (w1 - w0) * t;
+      }
       const g = wet * (d < 0.55 ? 1 : (1 - d) / 0.45);
       if (g > RIPARIAN[p]) RIPARIAN[p] = g;
     }
@@ -2561,6 +2772,12 @@ function mergeStream(Wg: number): void {
       const c = STREAM[p];
       if (c <= 0) continue;
       CARVE[p] = 1 - (1 - CARVE[p]) * (1 - c);
+      // The trough of whichever valley is deepest here (a fjord's, where a side valley opens into it).
+      if (c > CDOM[p]) {
+        CDOM[p] = c;
+        GLAC[p] = STREAM_G[p];
+        FJW[p] = STREAM_F[p];
+      }
       STREAM[p] = 0;
     }
   }
@@ -2658,6 +2875,8 @@ function rasterNetworks(md: MeshData, f: FieldData, L: number, x0g: number, y0g:
     // A fan's channels are braided washes over bare gravel or sand; a delta's
     // and an inland delta's single channels between levees.
     const fan = kind === 1;
+    /** A fan wash's least half-width (px): a share of the cone however little water it carries. */
+    const washPx = fan ? (0.022 * netInfo[io + 5]) / dRad : 0;
     st.seed = 100 * hash01(s0, n, 947);
     st.alpha = alpha * (months >= 4 ? 1 : 0.7);
     st.pat0 = st.pat1 = Channel.Distributary + 1;
@@ -2685,18 +2904,22 @@ function rasterNetworks(md: MeshData, f: FieldData, L: number, x0g: number, y0g:
       const by = NODE_PX[2 * (g - s0) + 1];
       const hA = half(pg);
       const hB = half(g);
-      const reach = Math.max(hA, hB) * (fan ? 4 : 3) + 4;
+      const reach = Math.max(hA, hB) * (fan ? 4 : 3) + 4 + 1.5 * washPx;
       if (Math.max(ax, bx) < -reach || Math.min(ax, bx) > Wg + reach || Math.max(ay, by) < -reach || Math.min(ay, by) > Hg + reach) continue;
       const nS = netCurve(f, n, g, dRad, x0g, y0g, shift);
       if (nS < 2) continue;
       const mp = CURVE_MP;
       if (fan) {
-        // The wash: a braided belt a few channels wide.
-        st.belt0 = 2.6 * hA;
-        st.belt1 = 2.6 * hB;
+        // The wash: a braided belt a few channels wide, its bare gravel a
+        // visible share of the cone however little water it carries.
+        const qTop = Math.max(1e-6, netQ[s0]);
+        st.belt0 = Math.max(2.6 * hA, washPx * (0.45 + 0.55 * Math.sqrt(netQ[pg] / qTop)));
+        st.belt1 = Math.max(2.6 * hB, washPx * (0.45 + 0.55 * Math.sqrt(netQ[g] / qTop)) * (netMouth[g] === 1 ? 0.5 : 1));
         st.chan0 = 2 * hA;
         st.chan1 = 2 * hB;
-        const bw = 2.6 * Math.max(1, netW[g]);
+        // (Along-channel lattice by the wash's own width, one for the whole fan,
+        // so its bars and channels are sized to the drawn belt.)
+        const bw = Math.max(2.6 * Math.max(1, netW[s0]), 0.03 * netInfo[io + 5] * R);
         st.tau0 = netDist[pg] / bw;
         st.tau1 = netDist[g] / bw;
         st.plain0 = st.plain1 = 0;
@@ -2708,8 +2931,12 @@ function rasterNetworks(md: MeshData, f: FieldData, L: number, x0g: number, y0g:
       // river-built deltas (a bird's foot's fingers, lobes); waves rework a
       // mouth's levees and tides keep its funnel open.
       if (kind === 0 && (netInfo[io + 1] <= 1 || netMouth[g] === 0)) {
-        const lv0 = 2.5 * hA + 1.5;
-        const lv1 = 2.5 * hB + 1.5;
+        // Banks a little wider than the channel on the ground (a channel
+        // width or so either side), never narrower than the drawn channel;
+        // tapering out toward the mouth.
+        const bank = (wM: number): number => (0.5 * wM + Math.min(1500, 250 + 0.5 * wM)) / mPerPx;
+        const lv0 = Math.max(hA + 0.8, bank(netW[pg]));
+        const lv1 = Math.max(hB + 0.8, bank(netW[g])) * (netMouth[g] === 1 ? 0.55 : 1);
         for (let s = 1; s < nS; s++) {
           const u0 = (s - 1) / (nS - 1);
           const u1 = s / (nS - 1);
@@ -2854,10 +3081,12 @@ function netCurve(f: FieldData, n: number, g: number, dRad: number, x0g: number,
     }
     toPx(vx, vy, vz, 2 * s);
   }
-  // Gentle bends of its own, once they would show (between nodes a channel
-  // would otherwise run as a ruled line): by distance down the channels, so
-  // branches leave a split alike and tiles agree; none at the apex or exit,
-  // where the river's own course joins.
+  // Gentle, irregular bends of its own, once they would show (between nodes a
+  // channel would otherwise run as a ruled line): distributaries are nearly
+  // straight, swinging a channel width or so over 20–30 widths, never a
+  // regular wiggle. By distance down the channels, so branches leave a split
+  // alike and tiles agree; none at the apex or exit, where the river's own
+  // course joins.
   const io = NET_INFO * n;
   const mPerPx = f.radiusKm * 1000 * dRad;
   const wA = f.netW[pg];
@@ -2872,10 +3101,12 @@ function netCurve(f: FieldData, n: number, g: number, dRad: number, x0g: number,
     for (let s = 0; s < nS; s++) {
       const u = s / (nS - 1);
       const W = wA + (wB - wA) * u;
-      const lam = 12 * W;
+      const lam = 26 * W;
       const d = dA + (dB - dA) * u;
-      const show = smooth01((lam / mPerPx - 6) / 6) * smooth01(d / lam) * (toExit ? smooth01(((1 - u) * (dB - dA)) / lam) : 1);
-      const off = (kS * W * show * Math.sin((2 * Math.PI * d) / lam + ph)) / mPerPx;
+      const show = smooth01((lam / mPerPx - 14) / 14) * smooth01(d / lam) * (toExit ? smooth01(((1 - u) * (dB - dA)) / lam) : 1);
+      const a2 = (2 * Math.PI * d) / lam;
+      const wave = (0.65 * Math.sin(a2 + ph) + 0.35 * Math.sin(2.37 * a2 + 2.1 * ph)) * (0.55 + 0.45 * Math.sin(0.31 * a2 + 0.7 * ph));
+      const off = (0.8 * kS * W * show * wave) / mPerPx;
       if (off === 0) continue;
       const a = Math.max(0, s - 1);
       const b = Math.min(nS - 1, s + 1);
@@ -2979,7 +3210,7 @@ export function renderWindow(ctx: RenderContext, opt: RenderOptions, win: PixelW
   rasterNetworks(md, f, L, x0g, y0g, Wg, Hg, dRad, showRivers, lcode);
 
   const { x: mx, y: my, z: mz, gStart, gCell, tri } = md;
-  const { elev, grad, amp, mtn, ocean, lake, lakeLevel, lakeKind, reef, color, dryness, ice, iceCover, iceMelt, shelf, scour, fjord, cellNet } = f;
+  const { elev, grad, amp, mtn, ocean, lake, lakeWet, lakeLevel, lakeKind, reef, color, dryness, ice, iceCover, iceMelt, shelf, scour, fjord, strand, cellNet } = f;
   const kr2 = (KERNEL_RADIUS * h) ** 2;
   const invKr2 = 1 / kr2;
   const f0 = 0.75 / h;
@@ -3042,10 +3273,23 @@ export function renderWindow(ctx: RenderContext, opt: RenderOptions, win: PixelW
   const lat0 = Math.PI / 2 - (y0g + 0.5) * dRad;
   let tRow = seedTriangle(md, Math.max(-1.57, Math.min(1.57, lat0)), -Math.PI + (x0g + 0.5) * dRad);
 
+  /** Delta and wetland lakes: their grid's spacing (radians). */
+  const pondSp = 6500 / R;
+  const bigSp = 22000 / R;
   for (let j = 0; j < Hg; j++) {
     const lat = Math.max(-Math.PI / 2 + 1e-7, Math.min(Math.PI / 2 - 1e-7, Math.PI / 2 - (y0g + j + 0.5) * dRad));
     const cl = Math.cos(lat);
     const pz = Math.sin(lat);
+    // (The lake grid's three rows around this row of pixels, and their longitude spacings.)
+    const pondCj = Math.floor(lat / pondSp);
+    const pondLon0 = pondSp / Math.max(0.05, Math.cos((pondCj - 0.5) * pondSp));
+    const pondLon1 = pondSp / Math.max(0.05, Math.cos((pondCj + 0.5) * pondSp));
+    const pondLon2 = pondSp / Math.max(0.05, Math.cos((pondCj + 1.5) * pondSp));
+    // (And those of the inland deltas' coarser grid of larger lakes.)
+    const bigCj = Math.floor(lat / bigSp);
+    const bigLon0 = bigSp / Math.max(0.05, Math.cos((bigCj - 0.5) * bigSp));
+    const bigLon1 = bigSp / Math.max(0.05, Math.cos((bigCj + 0.5) * bigSp));
+    const bigLon2 = bigSp / Math.max(0.05, Math.cos((bigCj + 1.5) * bigSp));
     let t = tRow;
     for (let i = 0; i < Wg; i++) {
       const p = j * Wg + i;
@@ -3064,6 +3308,7 @@ export function renderWindow(ctx: RenderContext, opt: RenderOptions, win: PixelW
       let sA = 0;
       let sM = 0;
       let sLake = 0;
+      let sWet = 0;
       let sReef = 0;
       let sa = 0;
       let sb = 0;
@@ -3077,6 +3322,7 @@ export function renderWindow(ctx: RenderContext, opt: RenderOptions, win: PixelW
       let sShelf = 0;
       let sScour = 0;
       let sFjord = 0;
+      let sStrand = 0;
       let sNet = 0;
       let netCellW = 0;
       let netOfCells = -1;
@@ -3103,6 +3349,7 @@ export function renderWindow(ctx: RenderContext, opt: RenderOptions, win: PixelW
         sM += w * mtn[q];
         sScour += w * scour[q];
         sFjord += w * fjord[q];
+        sStrand += w * strand[q];
         if (ocean[q]) {
           swO += w;
           seO += w * v;
@@ -3140,6 +3387,7 @@ export function renderWindow(ctx: RenderContext, opt: RenderOptions, win: PixelW
           const lk = lake[q];
           if (lk >= 0) {
             sLake += w;
+            sWet += w * lakeWet[q];
             if (w > lakeW) {
               lakeW = w;
               lakeId = lk;
@@ -3223,7 +3471,8 @@ export function renderWindow(ctx: RenderContext, opt: RenderOptions, win: PixelW
           dRho = 0.5;
           dGap = 1e9;
         }
-        plainW = smooth01((sNet / swL - 0.12) / 0.5);
+        // (Its edge wanders with the ground's own relief, not the round sweep of the cells' kernel.)
+        plainW = smooth01((sNet / swL - 0.12 + 0.14 * Dn) / 0.5);
       }
       if (dNet >= 0 && f.netInfo[NET_INFO * dNet] === 0) plainW = !meshLand ? 1 : Math.max(plainW, Math.min(1, LEVEE[p]));
       if (isLand && !meshLand) {
@@ -3232,23 +3481,24 @@ export function renderWindow(ctx: RenderContext, opt: RenderOptions, win: PixelW
         e = S + 0.35 * Dn;
       } else if (isLand) {
         S = seL / swL;
-        const dry = landSurface(noise, px, py, pz, h, R, A, Dn, CARVE[p], S, sIce / swL, sCov / swL, sCov > 0 ? sIce / sCov : 0, sFjord / sw, sLake / sw, swO / sw, K);
+        const dry = landSurface(noise, px, py, pz, h, R, A, Dn, CARVE[p], S, sIce / swL, sCov / swL, sCov > 0 ? sIce / sCov : 0, GLAC[p], FJW[p], sLake / sw, swO / sw, K);
         let e0 = surfE;
         flags = surfFlags;
         if (!dry) {
           cls = SEA;
           e = e0;
         } else {
+          /** The ground before any floodplain levels it: a river's floor never stands up out of a lake. */
+          const eBed = e0;
           // A floodplain or braidplain: a flat valley floor at the river's level
           // (only ever lowered: glacial troughs and lake basins keep their depth).
           const fpl = FLOOD[p];
           if (fpl > 0 && flags === 0 && surfLake === 0) {
-            const cv = CARVE[p];
-            // Hummocks of the sub-cell relief smoothed away over the whole floodplain...
-            e0 -= 0.7 * fpl * A * Dn * (1 - cv * cv);
-            // ...and the valley's floor flattened where it is cut deep.
-            const floorE = S - (0.3 * A + 4);
-            if (e0 > floorE) e0 += (floorE - e0) * 0.9 * fpl * smooth01((cv - 0.25) / 0.5);
+            // Flat ground a little above its river, the river's own deposits
+            // having filled its hollows to that level: at the river's level,
+            // never a causeway standing above the country beside it.
+            const floorE = surfRiver + 1.5 + 2 * (1 - CARVE[p]);
+            e0 += (floorE - e0) * fpl;
           }
           // Coastal land rises from the shoreline.
           if (swO > 0) e0 = 1 + (e0 - 1) * smooth01(chi / 0.3);
@@ -3261,25 +3511,22 @@ export function renderWindow(ctx: RenderContext, opt: RenderOptions, win: PixelW
           e0 = floor + 0.5 * (dFl + Math.sqrt(dFl * dFl + 2.25));
           e = e0;
           if (surfLake > 0) {
-            // A lake in a glacial trough's basin behind its sill.
+            // A ribbon lake in a glacial trough's basin, behind its rock bar.
             cls = LAKE;
+            flags |= F_TROUGH;
             lakeDepth = surfLake;
-          } else if (
-            flags === 0 &&
-            lakeId >= 0 &&
-            e < lakeLevel[lakeId] &&
-            // Where the ground alone doesn't hem the lake in, a ragged edge rather
-            // than a circle, gaining finer coves and points as you zoom in.
-            sLake / sw + 0.3 * raggedEdge(noise, px, py, pz, f0 * 2.5, K) > 0.22
-          ) {
+          } else if (flags === 0 && lakeId >= 0 && lakeAt(noise, px, py, pz, f0, K, sWet / sw, sLake / sw, Math.min(e, eBed), lakeLevel[lakeId])) {
             const kind = lakeKind[lakeId];
+            const lvl = lakeLevel[lakeId];
             if (kind === 2) {
               // Salt flat: a dead-level crust where the basin's floods evaporate.
-              e = lakeLevel[lakeId];
+              e = lvl;
               flags = F_FLAT;
             } else {
+              // (Its bed lies under the water even where a hummock of the land around would stand.)
+              e = Math.min(e, eBed, lvl - 1 - 6 * smooth01((sWet / sw - 0.5) / 0.5));
               cls = kind === 1 ? SALT : LAKE;
-              lakeDepth = lakeLevel[lakeId] - e;
+              lakeDepth = lvl - e;
             }
           } else if (flags === 0 && hPx >= 20 && sScour > 0.01 * sw) {
             // Ice-scoured lowlands: countless small lakes in the hollows the ice
@@ -3303,19 +3550,47 @@ export function renderWindow(ctx: RenderContext, opt: RenderOptions, win: PixelW
         S = seO / swO;
         if (swL > 0) {
           // Extrapolated landward along their slopes, the ocean cells' surface
-          // can rise above the sea near the shore: it stays below a shoreface
-          // deepening away from the coast (else the shallows there would be
-          // clipped flat at the waterline, a plateau with a hard edge).
-          // (It lifts away out where the land's kernel ends: no edge there.)
-          const face = -2 - 40 * smooth01(-chi / 0.5) + 4000 * smooth01((-chi - 0.6) / 0.35);
+          // can rise above the sea near the shore: it stays below a shallow
+          // shoreface (else the shallows there would be clipped flat at the
+          // waterline, a plateau with a hard edge). Only a few metres deep and
+          // let go gradually offshore, so it digs no trough along the coast
+          // and leaves no step where it ends.
+          const face = -1 - 5 * smooth01(-chi / 0.5);
           const dFc = S - face;
-          S = face + 0.5 * (dFc - Math.sqrt(dFc * dFc + 16));
+          const capped = face + 0.5 * (dFc - Math.sqrt(dFc * dFc + 4));
+          S += (capped - S) * (1 - smooth01((-chi - 0.35) / 0.5));
         }
         let e0 = S + (0.6 * A + 12) * Dn;
         if (swL > 0) e0 = -1 + (e0 + 1) * smooth01(-chi / 0.3);
         const dSe = e0 + 0.5;
         e = -0.5 + 0.5 * (dSe - Math.sqrt(dSe * dSe + 0.36));
         cls = SEA;
+        const stK = sStrand / sw;
+        if (stK > 0.04 && sShelf === 0) {
+          // A strandflat: a low rock platform just under the sea along a
+          // glaciated hard-rock coast, its skerries and islets standing out of
+          // shallow sounds, clustered into archipelagos (finer ones as you zoom in).
+          const wS = smooth01((stK - 0.04) / 0.36);
+          const fs = R / 3200;
+          const plat = -4 - 26 * (0.5 + 0.5 * noise.noise(px * fs * 0.6 - 17.9, py * fs * 0.6 + 3.1, pz * fs * 0.6 + 44.2));
+          if (e < plat) e += (plat - e) * wS;
+          if (swL > 0 && e > -45) {
+            let kn = 0;
+            let a = 1;
+            let fr = fs;
+            for (let k = 0, nk = Math.max(2, Math.min(7, K - 2)); k < nk; k++) {
+              kn += a * noise.noise(px * fr + 71.3 - 9.7 * k, py * fr - 13.1 + 4.9 * k, pz * fr + 29.5);
+              a *= 0.5;
+              fr *= 2.1;
+            }
+            const arch = noise.noise(px * fs * 0.12 + 5.5, py * fs * 0.12 - 61.7, pz * fs * 0.12 + 12.3);
+            const thr = 0.62 - 0.3 * wS - 0.14 * arch;
+            if (kn > thr) {
+              cls = LAND;
+              e = 1 + 28 * Math.min(1, (kn - thr) / 0.35);
+            }
+          }
+        }
         const shelfK = sShelf / swO;
         if (shelfK > 0.05) {
           // Floating ice shelf with a ragged calving front.
@@ -3332,18 +3607,32 @@ export function renderWindow(ctx: RenderContext, opt: RenderOptions, win: PixelW
       if (dNet >= 0 && plainW > 0.6 && cls === LAND && flags === 0 && hPx >= 12) {
         const io = NET_INFO * dNet;
         const kind = f.netInfo[io];
-        const wet = 1 - smooth01((f.netInfo[io + 7] - 0.4) / 0.3);
+        // (An inland delta's pools are its river's floods, however dry the country round it.)
+        const wet = Math.max(kind === 2 ? 0.85 : 0, 1 - smooth01((f.netInfo[io + 7] - 0.4) / 0.3));
         if (wet > 0 && LEVEE[p] < 0.2 && COVER[p] < 0.05 && (kind === 2 || (kind === 0 && f.netInfo[io + 1] <= 1))) {
-          const fp = R / 4500;
-          // (Ponds a few pixels across or more: below that they would be speckle.)
-          const thr = (kind === 2 ? 0.42 : 0.78 - 0.38 * smooth01((dRho - 0.4) / 0.45)) + 0.6 * (1 - wet) + 2 * (1 - smooth01((fp * dRad) ** -1 / 3 - 1)) + 0.5 * (1 - plainW);
-          let pn = noise.noise(px * fp + 71.3, py * fp - 12.9, pz * fp + 33.1);
-          // (Finer octaves only where they could still lift it past the threshold.)
-          if (hPx >= 40 && pn > thr - 0.65) pn += 0.45 * noise.noise(px * fp * 2.7 - 5.5, py * fp * 2.7 + 48.2, pz * fp * 2.7 - 9.1);
-          if (hPx >= 120 && pn > thr - 0.2) pn += 0.2 * noise.noise(px * fp * 7.3 + 15.1, py * fp * 7.3 - 2.6, pz * fp * 7.3 + 60.4);
-          if (pn > thr) {
-            cls = LAKE;
-            lakeDepth = 1 + 8 * (pn - thr);
+          // Lakes in the low ground between the channels: scattered over an
+          // inland delta, on a river-built delta's outer plain. Each is an
+          // object of its own (a centre on a jittered grid, a size, an
+          // elongated, lobed outline), the same at every zoom; from afar those
+          // under about a pixel and a half are left out whole, never drawn as
+          // specks.
+          const density = (kind === 2 ? 0.5 : 0.04 + 0.26 * smooth01((dRho - 0.45) / 0.4)) * wet * smooth01((plainW - 0.6) / 0.3);
+          if (density > 0.005) {
+            // (The pixel's own longitude, from its column.)
+            let lon = -Math.PI + (x0g + i + 0.5) * dRad;
+            lon -= 2 * Math.PI * Math.round(lon / (2 * Math.PI));
+            // (0.4–3 km across, most often small; an inland delta's run half as large again.)
+            const big = kind === 2 ? 1.5 : 1;
+            let best = pondNear(lat, lon, cl, pondSp, pondCj, pondLon0, pondLon1, pondLon2, 9100, density, (big * 250) / R, (big * 1600) / R, dRad, Dn);
+            if (kind === 2) {
+              // And a few lakes of tens of square kilometres among them (the
+              // Niger's Debo, the Okavango's lagoons), on a coarser grid of their own.
+              best = Math.min(best, pondNear(lat, lon, cl, bigSp, bigCj, bigLon0, bigLon1, bigLon2, 9200, 0.9 * density, 2200 / R, 6000 / R, dRad, Dn));
+            }
+            if (best < 1) {
+              cls = LAKE;
+              lakeDepth = 1 + 6 * (1 - best);
+            }
           }
         }
       }
@@ -3501,12 +3790,22 @@ export function renderWindow(ctx: RenderContext, opt: RenderOptions, win: PixelW
                         b += (138 - b) * kc;
                       }
                     } else if (form >= 1 && form <= 3) {
-                      // Beach ridges parallel to a wave-built front, older inland.
-                      const lam = 380 / (R * dRad);
-                      const zone = (0.15 + 0.35 * f.netInfo[io + 2]) * R0;
-                      const kr = (form === 1 ? 0.35 : 1) * (1 - smooth01(dGap / Math.max(1, zone))) * smooth01((lam - 3) / 3) * netFirm;
+                      // Beach ridges: sets of low sandy ridges along a wave-built
+                      // front, a strip a few km deep (older ones inland), uneven
+                      // and broken into sets, cut where channels cross; seen
+                      // only close in. (A lobate delta has them only where waves
+                      // are strong.)
+                      const waveI = f.netInfo[io + 2];
+                      const mPx = R * dRad;
+                      const lam = 320 / mPx;
+                      const zone = ((1200 + 4500 * waveI) * (form === 1 ? 0.6 : 1)) / mPx;
+                      const kr = (form === 1 ? smooth01((waveI - 0.35) / 0.3) : 1) * (1 - smooth01(dGap / Math.max(1, zone))) * smooth01((lam - 4) / 4) * netFirm * (1 - smooth01(LEVEE[p] / 0.4));
                       if (kr > 0) {
-                        const kk = 0.22 * kr * Math.cos((2 * Math.PI * dGap) / lam + 0.8 * Dn);
+                        // (Sets, and their uneven spacing, from the ground's own
+                        // relief: its broad swells and its finer roughness.)
+                        const sets = smooth01((reliefLow + 0.2) / 0.4);
+                        const warpPh = 3 * (Dn - reliefLow);
+                        const kk = 0.2 * kr * sets * Math.cos((2 * Math.PI * dGap) / lam + 0.8 * Dn + warpPh);
                         r += (kk > 0 ? 214 - r : 70 - r) * Math.abs(kk);
                         g += (kk > 0 ? 200 - g : 98 - g) * Math.abs(kk);
                         b += (kk > 0 ? 156 - b : 58 - b) * Math.abs(kk);
@@ -3568,13 +3867,15 @@ export function renderWindow(ctx: RenderContext, opt: RenderOptions, win: PixelW
             } else {
               [r, g, b] = pal.ramp(pal.SEA, e);
               // Reef flats: turquoise where tropical shallows are, fading out smoothly.
-              const reefK = 0.4 * smooth01((sReef / swO - 0.25) / 0.5) * smooth01((e + 70) / 40);
+              // (A fjord reaches far inland, beyond the ocean cells: its water takes the land's warmth.)
+              const reefK = swO > 0 ? 0.4 * smooth01((sReef / swO - 0.25) / 0.5) * smooth01((e + 70) / 40) : 0;
               if (reefK > 0) {
                 r += (70 - r) * reefK;
                 g += (176 - g) * reefK;
                 b += (184 - b) * reefK;
               }
-              const ice = Math.max(0, Math.min(1, (-1.5 - sb / swO) / 4));
+              const tw = swO > 0 ? sb / swO : swL > 0 ? sa / swL : 10;
+              const ice = Math.max(0, Math.min(1, (-1.5 - tw) / 4));
               r += (226 - r) * ice;
               g += (236 - g) * ice;
               b += (242 - b) * ice;

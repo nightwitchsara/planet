@@ -3,6 +3,7 @@ import type { SphereMesh } from '../core/mesh';
 import { seedFor } from '../core/rng';
 import { Channel, type DeltaForm } from '../world/channels';
 import { MAX_GLACIAL_EROSION } from '../world/glaciers';
+import { Deposit } from '../world/sediment';
 import type { World } from '../world/world';
 
 /**
@@ -49,6 +50,11 @@ export interface FieldData {
   mtn: Float32Array;
   ocean: Uint8Array;
   lake: Int32Array;
+  /**
+   * 0–1 per lake cell: how much of it lies under its lake's water, 1 along the
+   * way the water crosses the lake from each river's mouth to the outlet.
+   */
+  lakeWet: Float32Array;
   /** Per lake: water surface (or salt-flat floor) and kind (0 fresh, 1 saline, 2 salt flat). */
   lakeLevel: Float32Array;
   lakeKind: Uint8Array;
@@ -64,6 +70,12 @@ export interface FieldData {
   scour: Float32Array;
   /** 0–1: ice-age glaciers cut this coast into fjords. */
   fjord: Float32Array;
+  /**
+   * 0–1: a strandflat off this coast, the low rock platform that frost, waves
+   * and ice planed along glaciated hard-rock coasts, its skerries and islets
+   * standing out of shallow sounds (ocean cells, and the land cells on its coast).
+   */
+  strand: Float32Array;
   reef: Uint8Array;
   color: Uint8Array;
   biome: Uint8Array;
@@ -155,6 +167,14 @@ export interface FieldData {
    */
   rivBraid: Float32Array;
   rivAnas: Float32Array;
+  /**
+   * Per chain node: how deep (m) ice-age glaciers cut the valley into a trough
+   * (0: no glacial trough), and 0–1 how far the sea fills that trough: 1 along
+   * a fjord, 0.5 at its head (where the trough floor rises out of the sea),
+   * 0 above it and off the drowned troughs.
+   */
+  rivGlac: Float32Array;
+  rivFjord: Float32Array;
   /**
    * Per chain node: the delta, fan or inland delta (index into the net* arrays)
    * whose distributaries are drawn instead of the segment leaving it, else -1.
@@ -554,6 +574,15 @@ function buildRivers(world: World): Pick<FieldData, RiverFields> {
     if (!isRiver[c] || r < 0 || !isRiver[r]) continue;
     if (mainDonor[r] < 0 || discharge[c] > discharge[mainDonor[r]]) mainDonor[r] = c;
   }
+  // A lake's outflow is the main stem where it is the bigger water: its river
+  // starts at the lake (below), and a smaller stream meeting it there joins it
+  // (else the river would seem to rise from that stream, clear of the lake).
+  for (let c = 0; c < n; c++) {
+    const r = recv[c];
+    if (lake[c] < 0 || r < 0 || !isRiver[r] || lake[r] === lake[c]) continue;
+    const md = mainDonor[r];
+    if (discharge[c] > (md >= 0 ? discharge[md] : 0)) mainDonor[r] = -2;
+  }
   /**
    * Past its mouth a river heads for open water: the sea cell's neighbor with
    * the most sea around it, then the deepest. It is the same for every river
@@ -732,6 +761,175 @@ function buildRivers(world: World): Pick<FieldData, RiverFields> {
   };
 }
 
+/** Ice-age deepening (m, a cell's average) below which a valley shows no glacial trough. */
+const TROUGH_MIN_CUT = 8;
+/**
+ * In mountains a trough is cut up to this many times deeper than its cell's
+ * average lowering: valley walls channel the ice into troughs a few km wide (a
+ * fifth or so of a cell). Over low ground the ice spread out and scoured broadly.
+ */
+const TROUGH_FOCUS = 6;
+/** Troughs shallower than this (m) are not drawn. */
+const TROUGH_SHOWN = 60;
+/** Deepest trough (m): the deepest fjords (Sognefjord 1,308 m, Skelton Inlet 1,933 m). */
+const TROUGH_MAX = 1300;
+/** Deepest trough inland of the sea (m): lake basins in glacial valleys reach about this (Hornindalsvatnet 514 m). */
+const TROUGH_INLAND = 520;
+/** A fjord's floor lies at least this far below the sea along its length (m), or its head is reached. */
+const FJORD_FLOOR = 60;
+/** Shallowest trough that still makes a fjord (m). */
+const FJORD_TROUGH = 150;
+/**
+ * Glacial troughs (and fjords) follow valleys whose stream carries at least
+ * this (m³/s): drawn at every zoom level, whatever the river threshold, so a
+ * fjord neither appears nor vanishes as you zoom.
+ */
+export const TROUGH_Q = 15;
+
+/**
+ * Glacial troughs along the river chains. Ice-age outlet and valley glaciers
+ * cut their valleys into troughs: each node's depth is its cells' average
+ * lowering concentrated into a trough a few km wide (rivGlac, m), smoothed
+ * along the valley. Where a trough reaches the sea it is a fjord as far up
+ * the valley as its floor stays below the sea (rivFjord, 0.5 at the head),
+ * and its side valleys are fjord arms as far as theirs do. Inland of every
+ * fjord head troughs are shallower basins (they hold ribbon lakes).
+ */
+function glacialTroughs(world: World, riv: Pick<FieldData, RiverFields>, elev: Float32Array, amp: Float32Array): { rivGlac: Float32Array; rivFjord: Float32Array } {
+  const mesh = world.fine;
+  const { nbrStart, nbr } = mesh;
+  const cut = world.iceAge.erosion;
+  const { rivStart, rivCell, rivQ, rivSea, rivJoin } = riv;
+  const nNodes = rivCell.length;
+  const nChains = rivStart.length - 1;
+  // The ice ran down the valley floor: a node takes its own cell's lowering
+  // and some of the deepest beside it (the trough may lie along a cell edge).
+  // (Over low ground the ice's lowering spread broadly instead: less focus.)
+  const raw = new Float32Array(nNodes);
+  const relief = new Float32Array(nNodes);
+  for (let k = 0; k < nNodes; k++) {
+    const c = rivCell[k];
+    let mx = 0;
+    let ma = amp[c];
+    for (let j = nbrStart[c], e = nbrStart[c + 1]; j < e; j++) {
+      mx = Math.max(mx, cut[nbr[j]]);
+      ma = Math.max(ma, amp[nbr[j]]);
+    }
+    raw[k] = 0.6 * cut[c] + 0.4 * mx;
+    relief[k] = 0.5 * (amp[c] + ma);
+  }
+  const glac = new Float32Array(nNodes);
+  const KW = [1, 2, 3, 2, 1];
+  for (let ch = 0; ch < nChains; ch++) {
+    const s0 = rivStart[ch];
+    const s1 = rivStart[ch + 1];
+    for (let k = s0; k < s1; k++) {
+      let s = 0;
+      let r = 0;
+      let w = 0;
+      for (let d = -2; d <= 2; d++) {
+        const j = k + d;
+        if (j < s0 || j >= s1) continue;
+        s += KW[d + 2] * raw[j];
+        r += KW[d + 2] * relief[j];
+        w += KW[d + 2];
+      }
+      const e = s / w;
+      const rel = r / w;
+      const focus = 1 + (TROUGH_FOCUS - 1) * smoothstep(80, 500, rel);
+      // (No deeper than the hills it runs between allow: a broad shallow trough in low country.)
+      const g = e < TROUGH_MIN_CUT || rivQ[k] < TROUGH_Q ? 0 : Math.min(TROUGH_MAX, 1.6 * rel + 0.5 * e, focus * (e - 0.5 * TROUGH_MIN_CUT));
+      glac[k] = g < TROUGH_SHOWN ? 0 : g;
+    }
+  }
+  // Fjords: from each mouth up the valley while the trough floor (the valley
+  // floor below the sub-cell hills, less the trough) stays below the sea;
+  // trunks first, so a side valley opening off a drowned reach drowns too.
+  const fjord = new Float32Array(nNodes);
+  const floorAt = (k: number): number => {
+    const c = rivCell[k];
+    return elev[c] - 0.3 * amp[c] - glac[k];
+  };
+  /** 0–1 from the floor's depth: 0.5 where it meets the sea. */
+  const drown = (floor: number): number => Math.max(0, Math.min(1, 0.5 - floor / 200));
+  const order = Array.from({ length: nChains }, (_, i) => i).sort((a, b) => rivQ[rivStart[b + 1] - 1] - rivQ[rivStart[a + 1] - 1]);
+  for (const ch of order) {
+    const s0 = rivStart[ch];
+    const last = rivStart[ch + 1] - 1;
+    const w0 = rivSea[ch] ? 1 : rivJoin[ch] >= 0 ? fjord[rivJoin[ch]] : 0;
+    if (w0 < 0.5) continue;
+    fjord[last] = w0;
+    for (let k = last - 1; k >= s0; k--) {
+      const fl = floorAt(k);
+      if (glac[k] >= FJORD_TROUGH && fl < -FJORD_FLOOR) {
+        fjord[k] = drown(fl + FJORD_FLOOR);
+        continue;
+      }
+      // The head: the first node out of the sea (the drowned reach ends between it and the last).
+      fjord[k] = glac[k] > 0 ? Math.min(0.42, drown(fl + FJORD_FLOOR)) : 0;
+      break;
+    }
+  }
+  // Inland of the fjords troughs are shallower: basins that hold lakes.
+  for (let k = 0; k < nNodes; k++) if (fjord[k] < 0.5 && glac[k] > TROUGH_INLAND) glac[k] = TROUGH_INLAND;
+  return { rivGlac: glac, rivFjord: fjord };
+}
+
+/** How well each bedrock (geology.ts Rock order) keeps a strandflat: hard crystalline rock planes flat and stands as skerries; soft sedimentary rock erodes away. */
+const STRAND_ROCK = [0, 0, 0.5, 0.45, 1, 1, 1, 0.7, 0.6, 0, 0, 0, 0];
+
+/**
+ * Strandflats: the low rock platform along glaciated hard-rock coasts (the
+ * Norwegian skerry coast), planed by frost, sea ice and waves at the shore
+ * over the ice ages, out to tens of km from the coast and just under the sea,
+ * with countless skerries and islets on it. On coasts the ice-age glaciers cut
+ * (fjord coasts) or scoured, in hard rock, never where rivers built deltas or
+ * plains; spread over the shallow ocean cells off them.
+ */
+function strandflats(world: World, fjord: Float32Array, elev: Float32Array): Float32Array {
+  const mesh = world.fine;
+  const n = mesh.n;
+  const { nbrStart, nbr } = mesh;
+  const ocean = world.ocean;
+  const rock = world.lithology.rock;
+  const dep = world.deposits.kind;
+  const scour = world.iceAge.scour;
+  const out = new Float32Array(n);
+  for (let c = 0; c < n; c++) {
+    if (ocean[c]) continue;
+    let coastal = false;
+    for (let k = nbrStart[c], e = nbrStart[c + 1]; k < e; k++) {
+      if (ocean[nbr[k]]) {
+        coastal = true;
+        break;
+      }
+    }
+    if (!coastal) continue;
+    const d = dep[c];
+    if (d === Deposit.Delta || d === Deposit.Alluvium || d === Deposit.Fan || d === Deposit.Lake || d === Deposit.Peat || d === Deposit.Dunes || d === Deposit.Playa) continue;
+    // (The coast itself was under the ice-age ice and worn by it.)
+    const cutHere = world.iceAge.erosion[c];
+    const glaciated = cutHere <= 0 ? 0 : Math.max(smoothstep(0.15, 0.6, fjord[c]), smoothstep(10, 60, cutHere), 0.8 * smoothstep(0.4, 0.9, scour[c]) * smoothstep(5, 40, cutHere));
+    out[c] = glaciated * (STRAND_ROCK[rock[c]] ?? 0);
+  }
+  // Out over the shallow sea beside such coasts (two rings), fading with depth and distance.
+  let front = Float32Array.from(out);
+  for (let ring = 0; ring < 2; ring++) {
+    const next = Float32Array.from(front);
+    for (let c = 0; c < n; c++) {
+      if (!ocean[c] || out[c] > 0) continue;
+      let best = 0;
+      for (let k = nbrStart[c], e = nbrStart[c + 1]; k < e; k++) best = Math.max(best, front[nbr[k]]);
+      if (best <= 0) continue;
+      const v = best * (ring === 0 ? 1 : 0.6) * (1 - smoothstep(90, 260, -elev[c]));
+      if (v > next[c]) next[c] = v;
+    }
+    front = next;
+  }
+  for (let c = 0; c < n; c++) if (ocean[c]) out[c] = front[c];
+  return out;
+}
+
 type NetFields =
   | 'rivNet' | 'netStart' | 'netX' | 'netY' | 'netZ' | 'netParent' | 'netNext' | 'netQ' | 'netW' | 'netMouth' | 'netDist'
   | 'netFrame' | 'netTheta' | 'netFront' | 'netInfo' | 'netBox' | 'netUp' | 'netDown' | 'netExit' | 'netCell' | 'cellNet';
@@ -832,11 +1030,39 @@ function buildNetworks(world: World, riv: Pick<FieldData, RiverFields>): Pick<Fi
     if (net.exit >= 0 && exitTo >= 0) exitG[i] = base + net.exit;
     // The river's mean flow over the network's bankfull one.
     const qRatio = k0 >= 0 ? rivQ[k0] / Math.max(1e-6, net.q[0]) : 0.3;
+    // Its ends snap to the river: the apex onto the chain node it hands over
+    // at, the exit onto the river it runs on into. The nodes near each move
+    // with it, less with distance, so no channel doubles back to the snapped
+    // point.
+    const shifts: number[] = [];
+    const addShift = (j: number, c: number): void => {
+      const dx = x[c] - net.x[j];
+      const dy = y[c] - net.y[j];
+      const dz = z[c] - net.z[j];
+      const off = Math.hypot(dx, dy, dz);
+      if (off > 1e-9) shifts.push(j, dx, dy, dz, Math.max(3 * off, (0.3 * net.radiusKm) / world.params.radiusKm));
+    };
+    if (k0 >= 0) addShift(0, rivCell[k0]);
+    if (net.exit >= 0 && exitTo >= 0) addShift(net.exit, exitTo);
     for (let j = 0; j < m; j++) {
       const g = base + j;
       let px = net.x[j];
       let py = net.y[j];
       let pz = net.z[j];
+      for (let s = 0; s < shifts.length; s += 5) {
+        const js = shifts[s];
+        const d = js === j ? 0 : Math.hypot(net.x[j] - net.x[js], net.y[j] - net.y[js], net.z[j] - net.z[js]);
+        const t = d / shifts[s + 4];
+        if (t >= 1) continue;
+        const wgt = (1 - t) * (1 - t);
+        px += shifts[s + 1] * wgt;
+        py += shifts[s + 2] * wgt;
+        pz += shifts[s + 3] * wgt;
+      }
+      const pl = Math.hypot(px, py, pz) || 1;
+      px /= pl;
+      py /= pl;
+      pz /= pl;
       const snap = j === 0 && k0 >= 0 ? rivCell[k0] : j === net.exit && exitTo >= 0 ? exitTo : -1;
       if (snap >= 0) {
         px = x[snap];
@@ -912,6 +1138,25 @@ function buildNetworks(world: World, riv: Pick<FieldData, RiverFields>): Pick<Fi
     const dryness = pet[ac] > 0 ? Math.max(0, Math.min(1, 1 - world.precipYear[ac] / pet[ac])) : 0;
     let tMean = 0;
     for (let mo = 0; mo < 12; mo++) tMean += world.temp[ac * 12 + mo] / 12;
+    // Land it builds out past the cells' coast takes the colour of its plain
+    // (the mean of its land cells), not of the river's own cell at the apex.
+    let cr = 0;
+    let cg = 0;
+    let cb = 0;
+    let cn = 0;
+    for (const c of net.cells) {
+      if (world.ocean[c]) continue;
+      cr += color[3 * c];
+      cg += color[3 * c + 1];
+      cb += color[3 * c + 2];
+      cn++;
+    }
+    if (cn === 0) {
+      cr = color[3 * ac];
+      cg = color[3 * ac + 1];
+      cb = color[3 * ac + 2];
+      cn = 1;
+    }
     info.set(
       [
         net.kind === 'delta' ? 0 : net.kind === 'fan' ? 1 : 2,
@@ -922,9 +1167,9 @@ function buildNetworks(world: World, riv: Pick<FieldData, RiverFields>): Pick<Fi
         (net.radiusKm * 1000) / Rm,
         k0 >= 0 ? rivFlow[k0] : 12,
         dryness,
-        color[3 * ac],
-        color[3 * ac + 1],
-        color[3 * ac + 2],
+        cr / cn,
+        cg / cn,
+        cb / cn,
         tMean,
       ],
       NET_INFO * i,
@@ -961,6 +1206,42 @@ function buildNetworks(world: World, riv: Pick<FieldData, RiverFields>): Pick<Fi
  * Per-version fields, taken from whatever the world currently holds (during a
  * brush stroke that is the previewed relief with the last climate and rivers).
  */
+/**
+ * Each lake cell's share under its water, raised to 1 along the way the water
+ * crosses the lake: from the mouth of every drawn river and from the lake's
+ * lowest point to its outlet. The lake then draws as one body that its inlets
+ * and its outlet all touch, instead of whichever sub-cell hollows dip below
+ * its surface (side pools that rivers fed with no way on to the main water).
+ */
+function lakeWetField(world: World): Float32Array {
+  const { lake, lakeWet, lakes, discharge, routing } = world.hydro;
+  const recv = routing.receiver;
+  const ocean = world.ocean;
+  const n = lake.length;
+  const thr = Math.max(1, world.params.riverThreshold * MIN_STREAM_FRACTION);
+  const wet = Float32Array.from(lakeWet);
+  const done = new Uint8Array(n);
+  const walk = (c0: number): void => {
+    const L = lake[c0];
+    for (let c = c0, g = 0; c >= 0 && g < n && lake[c] === L && !done[c]; c = recv[c], g++) {
+      done[c] = 1;
+      wet[c] = 1;
+    }
+  };
+  for (let c = 0; c < n; c++) {
+    if (ocean[c] || lake[c] >= 0 || discharge[c] < thr) continue;
+    const r = recv[c];
+    if (r >= 0 && !ocean[r] && lake[r] >= 0 && lakes[lake[r]].kind !== 2) walk(r);
+  }
+  const low = new Int32Array(lakes.length).fill(-1);
+  for (let c = 0; c < n; c++) {
+    const L = lake[c];
+    if (L >= 0 && (low[L] < 0 || world.elev[c] < world.elev[low[L]])) low[L] = c;
+  }
+  for (let L = 0; L < lakes.length; L++) if (low[L] >= 0 && lakes[L].outflow > 0) walk(low[L]);
+  return wet;
+}
+
 export function buildFields(world: World, meshId: string, version: number): FieldData {
   const mesh = world.fine;
   const n = mesh.n;
@@ -1024,6 +1305,7 @@ export function buildFields(world: World, meshId: string, version: number): Fiel
     mtn,
     ocean,
     lake: hydro.lake,
+    lakeWet: lakeWetField(world),
     lakeLevel: Float32Array.from(hydro.lakes, (l) => l.level),
     lakeKind: Uint8Array.from(hydro.lakes, (l) => l.kind),
     dryness,
@@ -1033,6 +1315,7 @@ export function buildFields(world: World, meshId: string, version: number): Fiel
     shelf: ice.shelf,
     scour,
     fjord,
+    strand: strandflats(world, fjord, elev),
     reef: world.relief.reef,
     color: world.biomes.color,
     biome: world.biomes.biome,
@@ -1052,6 +1335,7 @@ export function buildFields(world: World, meshId: string, version: number): Fiel
     temp: world.temp,
     precip: world.precip,
     ...rivers,
+    ...glacialTroughs(world, rivers, elev, amp),
     ...buildNetworks(world, rivers),
   };
 }
