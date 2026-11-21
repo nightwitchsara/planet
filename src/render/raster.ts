@@ -7,7 +7,7 @@ import { DEPOSIT_COLORS } from '../world/sediment';
 import { SOIL_INFO } from '../world/soils';
 import { B_CONVERGENT, B_DIVERGENT, B_TRANSFORM } from '../world/tectonics/boundaries';
 import { Channel } from '../world/channels';
-import { CHANNEL_WIDTH, type FieldData, KERNEL_RADIUS, type MeshData, MIN_STREAM_FRACTION, NET_BINS, NET_INFO, type RenderContext, TROUGH_Q } from './context';
+import { BED_SAMPLES, CHANNEL_WIDTH, type FieldData, KERNEL_RADIUS, type MeshData, MIN_STREAM_FRACTION, NET_BINS, NET_INFO, type RenderContext, TROUGH_Q } from './context';
 import * as pal from './palettes';
 
 export type LayerId =
@@ -262,6 +262,9 @@ let FJW = new Float32Array(0);
 let CDOM = new Float32Array(0);
 let STREAM_G = new Float32Array(0);
 let STREAM_F = new Float32Array(0);
+/** A stream's bed height (m) where its valley profile is highest (STREAM_Z), and the lowest bed of the valleys reaching each pixel (BEDZ; +Infinity: none). */
+let STREAM_Z = new Float32Array(0);
+let BEDZ = new Float32Array(0);
 /** Valley floors of rivers that flow most of the year (riparian vegetation). */
 let RIPARIAN = new Float32Array(0);
 /** Per-pixel surface flags (F_*). */
@@ -321,6 +324,8 @@ function scratch(G: number): void {
   CDOM = new Float32Array(G);
   STREAM_G = new Float32Array(G);
   STREAM_F = new Float32Array(G);
+  STREAM_Z = new Float32Array(G);
+  BEDZ = new Float32Array(G);
   RIPARIAN = new Float32Array(G);
   FLAGS = new Uint8Array(G);
   FLOOD = new Float32Array(G);
@@ -474,6 +479,8 @@ let surfFlags = 0;
 let surfLake = 0;
 /** The level of the river whose valley the last landSurface point lies in (m): its valley floor. */
 let surfRiver = 0;
+/** Input to landSurface: the bed height (m) of the river whose valley holds the point (+Infinity: none); the river never runs above it. */
+let surfBed = Infinity;
 
 /**
  * The surface where the land/sea field has land: ice where it covers the
@@ -590,6 +597,13 @@ function landSurface(
   // hollow its valley floor sinks with it.
   const Al = A * (1 - lakeShare) ** 2;
   surfRiver = ground - 4 - Al * Math.max(0.3, 0.25 - reliefLow) - trough;
+  // ...and never above its own bed, which only falls downstream (context.ts
+  // riverBeds: the same rule along its course, carried down as a running
+  // minimum): out of a hollow the river keeps its level, cutting down through
+  // the rise beyond instead of climbing over it.
+  // (Glacial troughs keep their own floors: basins between rock bars, ribbon lakes.)
+  // (Never by the bed alone below the sea at a mouth: the coast's low ground stays land.)
+  if (trough <= 0 && surfBed - 1.5 < surfRiver) surfRiver = Math.max(Math.min(surfRiver, 0.5), surfBed - 1.5);
   if (flags === 0) {
     // V-shaped valley: the ground falls from the relief around it to the river,
     // its hummocks smoothing out toward the floor; lake beds are smoothed too,
@@ -692,7 +706,7 @@ let courseTri = 0;
  * octaves? The pixel loop's own decision (roughChi, then landSurface), taken
  * with the river's valley carved in (cv 1 on a carved river's line, else 0).
  */
-function dryAt(md: MeshData, f: FieldData, noise: Simplex3, K: number, cv: number, px: number, py: number, pz: number, gd = 0, fw = 0): boolean {
+function dryAt(md: MeshData, f: FieldData, noise: Simplex3, K: number, cv: number, px: number, py: number, pz: number, gd = 0, fw = 0, bed = Infinity): boolean {
   const t = (courseTri = locate(md, px, py, pz, courseTri));
   const { x, y, z, gStart, gCell } = md;
   const { elev, grad, amp, ocean, mtn, fjord, ice, iceCover, lake } = f;
@@ -740,6 +754,7 @@ function dryAt(md: MeshData, f: FieldData, noise: Simplex3, K: number, cv: numbe
   const f0 = 0.75 / h;
   if (swO > 0 && roughChi(noise, sChi / sw, M, sF / sw, px, py, pz, f0, K) <= 0) return false;
   const Dn = subcellRelief(noise, px, py, pz, f0, K, M);
+  surfBed = bed;
   return landSurface(noise, px, py, pz, h, f.radiusKm * 1000, sA / sw, Dn, cv, seL / swL, sIce / swL, sCov / swL, sCov > 0 ? sIce / sCov : 0, cv > 0 ? gd : 0, fw, sLake / sw, swO / sw, K);
 }
 
@@ -847,6 +862,94 @@ function netJoinNode(f: FieldData, c: number, vx: number, vy: number, vz: number
   return bd >= Math.cos(maxAng) ? best : -1;
 }
 
+/** The bed (m) at u (0–1) along the segment leaving river node i, from its samples (context.ts riverBeds). */
+function bedAt(f: FieldData, i: number, u: number): number {
+  const t = Math.max(0, Math.min(1, u)) * BED_SAMPLES;
+  const s = Math.min(BED_SAMPLES - 1, Math.floor(t));
+  const a = f.rivBed[i * BED_SAMPLES + s];
+  const b = s + 1 < BED_SAMPLES ? f.rivBed[i * BED_SAMPLES + s + 1] : f.rivBed[(i + 1) * BED_SAMPLES];
+  return a + (b - a) * (t - s);
+}
+
+const STAG_PT = new Float64Array(3);
+
+/**
+ * The point at u (0–1) along the course of the segment leaving river node k
+ * (before its meanders: the centripetal Catmull–Rom curve through the cell
+ * centres), as a unit vector into `out`; false if k starts no segment.
+ */
+function trunkPoint(md: MeshData, f: FieldData, k: number, u: number, out: Float64Array): boolean {
+  if (k < 0) return false;
+  const tc = chainIndex(f)[k];
+  const s0 = f.rivStart[tc];
+  const s1 = f.rivStart[tc + 1];
+  if (k < s0 || k > s1 - 2) return false;
+  const { x, y, z } = md;
+  const a = f.rivCell[k];
+  const b = f.rivCell[k + 1];
+  const pa = k > s0 ? f.rivCell[k - 1] : -1;
+  const pb = k + 2 < s1 ? f.rivCell[k + 2] : k + 2 === s1 ? f.rivNext[tc] : -1;
+  const Q = TP_Q;
+  for (let d = 0; d < 3; d++) {
+    const va = d === 0 ? x[a] : d === 1 ? y[a] : z[a];
+    const vb = d === 0 ? x[b] : d === 1 ? y[b] : z[b];
+    Q[3 + d] = va;
+    Q[6 + d] = vb;
+    Q[d] = pa >= 0 ? (d === 0 ? x[pa] : d === 1 ? y[pa] : z[pa]) : 2 * va - vb;
+    Q[9 + d] = pb >= 0 ? (d === 0 ? x[pb] : d === 1 ? y[pb] : z[pb]) : 2 * vb - va;
+  }
+  const k01 = Math.max(1e-6, Math.sqrt(Math.hypot(Q[3] - Q[0], Q[4] - Q[1], Q[5] - Q[2])));
+  const k12 = Math.max(1e-6, Math.sqrt(Math.hypot(Q[6] - Q[3], Q[7] - Q[4], Q[8] - Q[5])));
+  const k23 = Math.max(1e-6, Math.sqrt(Math.hypot(Q[9] - Q[6], Q[10] - Q[7], Q[11] - Q[8])));
+  const t1 = k01;
+  const t2 = t1 + k12;
+  const t3 = t2 + k23;
+  const t = t1 + u * k12;
+  let l = 0;
+  for (let d = 0; d < 3; d++) {
+    const A1 = ((t1 - t) / t1) * Q[d] + (t / t1) * Q[3 + d];
+    const A2 = ((t2 - t) / k12) * Q[3 + d] + ((t - t1) / k12) * Q[6 + d];
+    const A3 = ((t3 - t) / k23) * Q[6 + d] + ((t - t2) / k23) * Q[9 + d];
+    const B1 = ((t2 - t) / t2) * A1 + (t / t2) * A2;
+    const B2 = ((t3 - t) / (t3 - t1)) * A2 + ((t - t1) / (t3 - t1)) * A3;
+    out[d] = ((t2 - t) / k12) * B1 + ((t - t1) / k12) * B2;
+    l += out[d] * out[d];
+  }
+  l = Math.sqrt(l) || 1;
+  for (let d = 0; d < 3; d++) out[d] /= l;
+  return true;
+}
+const TP_Q = new Float64Array(12);
+
+/**
+ * The point at u (0–1) along the drawn channel of the segment leaving river
+ * node k, meanders and all (so a tributary aimed at it meets the trunk's own
+ * course), as a unit vector into `out`; falls back to the course before its
+ * meanders. Uses (and leaves behind) the curve scratch.
+ */
+function trunkCoursePoint(md: MeshData, f: FieldData, k: number, u: number, dRad: number, x0g: number, y0g: number, lonShift: number, out: Float64Array): boolean {
+  if (k < 0) return false;
+  const tc = chainIndex(f)[k];
+  if (k < f.rivStart[tc] || k > f.rivStart[tc + 1] - 2) return false;
+  const nS = riverCurve(md, f, tc, k, dRad, x0g, y0g, lonShift);
+  if (nS < 2) return trunkPoint(md, f, k, u, out);
+  let best = 0;
+  let bd = Infinity;
+  for (let s = 0; s < nS; s++) {
+    const d = Math.abs(CURVE_V[s] - u);
+    if (d < bd) {
+      bd = d;
+      best = s;
+    }
+  }
+  const lon = (CURVE_MP[2 * best] + 0.5 + x0g) * dRad - Math.PI;
+  const lat = Math.PI / 2 - (CURVE_MP[2 * best + 1] + 0.5 + y0g) * dRad;
+  out[0] = Math.cos(lat) * Math.cos(lon);
+  out[1] = Math.cos(lat) * Math.sin(lon);
+  out[2] = Math.sin(lat);
+  return true;
+}
+
 function riverCurve(md: MeshData, f: FieldData, ch: number, i: number, dRad: number, x0g: number, y0g: number, lonShift: number): number {
   const { rivStart, rivCell, rivSea, rivNext, mtn } = f;
   const { x, y, z } = md;
@@ -867,24 +970,34 @@ function riverCurve(md: MeshData, f: FieldData, ch: number, i: number, dRad: num
   const netOut = i > s0 && f.rivNet[i - 1] >= 0 && f.rivNet[i] < 0 ? f.rivNet[i - 1] : -1;
   const gIn = netIn >= 0 ? f.netNext[f.netStart[netIn]] : -1;
   const gOut = netOut >= 0 && f.netExit[netOut] >= 0 ? f.netParent[f.netExit[netOut]] : -1;
+  // A tributary joining a network's hidden course (or a river reaching the sea
+  // inside the land a delta built out) runs on into the network's nearest
+  // channel, not to where the trunk's own course was or the old coast.
+  const joinG = i + 1 === s1 - 1 && netIn < 0 ? netJoinNode(f, rivSea[ch] === 1 && i >= s0 ? a : b, x[b], y[b], z[b], 0.75 * md.spacing) : -1;
+  // One of several tributaries meeting the trunk at one node joins it a
+  // little way up the trunk's last stretch instead, heading on down it.
+  // (Worked out first: it draws the trunk's curve in the same scratch.)
+  const jn = joinG < 0 && i + 1 === s1 - 1 ? f.rivJoin[ch] : -1;
+  const stagger = jn >= 0 && f.rivStag[ch] > 0 && f.rivGlac[jn] + (jn > 0 ? f.rivGlac[jn - 1] : 0) <= 0 && trunkCoursePoint(md, f, jn - 1, 1 - f.rivStag[ch], dRad, x0g, y0g, lonShift, STAG_PT);
   P[3] = x[a];
   P[4] = y[a];
   P[5] = z[a];
   P[6] = x[b];
   P[7] = y[b];
   P[8] = z[b];
-  // A tributary joining a network's hidden course (or a river reaching the sea
-  // inside the land a delta built out) runs on into the network's nearest
-  // channel, not to where the trunk's own course was or the old coast.
-  const joinG = i + 1 === s1 - 1 && netIn < 0 ? netJoinNode(f, rivSea[ch] === 1 && i >= s0 ? a : b, x[b], y[b], z[b], 0.75 * md.spacing) : -1;
   if (joinG >= 0) {
     P[6] = f.netX[joinG];
     P[7] = f.netY[joinG];
     P[8] = f.netZ[joinG];
   }
+  if (stagger) {
+    P[6] = STAG_PT[0];
+    P[7] = STAG_PT[1];
+    P[8] = STAG_PT[2];
+  }
   for (let k = 0; k < 3; k++) {
     P[k] = gOut >= 0 ? (k === 0 ? f.netX[gOut] : k === 1 ? f.netY[gOut] : f.netZ[gOut]) : pa >= 0 ? (k === 0 ? x[pa] : k === 1 ? y[pa] : z[pa]) : 2 * P[3 + k] - P[6 + k];
-    P[9 + k] = joinG >= 0 ? 2 * P[6 + k] - P[3 + k] : gIn >= 0 ? (k === 0 ? f.netX[gIn] : k === 1 ? f.netY[gIn] : f.netZ[gIn]) : pb >= 0 ? (k === 0 ? x[pb] : k === 1 ? y[pb] : z[pb]) : 2 * P[6 + k] - P[3 + k];
+    P[9 + k] = stagger ? (k === 0 ? x[b] : k === 1 ? y[b] : z[b]) : joinG >= 0 ? 2 * P[6 + k] - P[3 + k] : gIn >= 0 ? (k === 0 ? f.netX[gIn] : k === 1 ? f.netY[gIn] : f.netZ[gIn]) : pb >= 0 ? (k === 0 ? x[pb] : k === 1 ? y[pb] : z[pb]) : 2 * P[6 + k] - P[3 + k];
   }
   const seaEnd = rivSea[ch] === 1 && i + 1 === s1 - 1;
   const lonRef = Math.atan2(y[a], x[a]) + lonShift;
@@ -1257,6 +1370,7 @@ function riverReach(md: MeshData, f: FieldData, L: number): LazyReach {
   let gb = 0;
   let wa = 0;
   let wb = 0;
+  let segI = 0;
   // In the water drawn at this level, with the river's own valley carved in
   // (which ends at the sea cell: only the river runs on to the drawn coast),
   // and its trough (a fjord's water, where the sea fills it).
@@ -1266,7 +1380,8 @@ function riverReach(md: MeshData, f: FieldData, L: number): LazyReach {
     const cl = Math.cos(lat);
     const u = Math.min(1, CURVE_V[s]);
     const own = s < nMain ? cv : 0;
-    return !dryAt(md, f, noise, K, own, cl * Math.cos(lon), cl * Math.sin(lon), Math.sin(lat), ga + (gb - ga) * u, wa + (wb - wa) * u);
+    // (With its own bed, as the pixels will be drawn: where its floor sinks to it, a trough lake may cover it.)
+    return !dryAt(md, f, noise, K, own, cl * Math.cos(lon), cl * Math.sin(lon), Math.sin(lat), ga + (gb - ga) * u, wa + (wb - wa) * u, own > 0 ? bedAt(f, segI, u) : Infinity);
   };
   // First wet curve point: every point (2.5 px apart) while a cell spans few
   // pixels, so no strait goes unseen; deeper in every `stride`-th (water under
@@ -1296,6 +1411,7 @@ function riverReach(md: MeshData, f: FieldData, L: number): LazyReach {
     wetDrop[i] = lost;
     // Only drawn segments near the sea, deep below it, or in a fjord's trough
     // can meet the water; a carved valley at a mouth may run on past its sea cell.
+    segI = i;
     ga = f.rivGlac[i];
     gb = f.rivGlac[i + 1];
     wa = f.rivFjord[i];
@@ -1460,6 +1576,7 @@ function rasterRivers(md: MeshData, f: FieldData, L: number, x0g: number, y0g: n
   GLAC.fill(0, 0, G);
   FJW.fill(0, 0, G);
   CDOM.fill(0, 0, G);
+  BEDZ.fill(Infinity, 0, G);
   RIPARIAN.fill(0, 0, G);
   FLOOD.fill(0, 0, G);
   BELT.fill(0, 0, G);
@@ -1642,6 +1759,8 @@ function rasterRivers(md: MeshData, f: FieldData, L: number, x0g: number, y0g: n
           const wb = f.rivFjord[i + 1];
           let g0 = ga;
           let w0 = wa;
+          // Its bed, falling from node to node (on past the sea cell, the sea).
+          let z0 = bedAt(f, i, 0);
           for (let s = step; s < nCarve + step - 1; s += step) {
             const si = Math.min(nCarve - 1, s);
             // Within the trunk's valley a tributary's valley opens out into it.
@@ -1649,11 +1768,13 @@ function rasterRivers(md: MeshData, f: FieldData, L: number, x0g: number, y0g: n
             const u = Math.min(1, CURVE_V[si]);
             const g1 = ga + (gb - ga) * u;
             const w1 = wa + (wb - wa) * u;
-            stampCarve(ax[2 * si], ax[2 * si + 1], px0, py0, V, wet, Wg, Hg, g1, g0, w1, w0);
+            const z1 = bedAt(f, i, u);
+            stampCarve(ax[2 * si], ax[2 * si + 1], px0, py0, V, wet, Wg, Hg, g1, g0, w1, w0, z1, z0);
             px0 = ax[2 * si];
             py0 = ax[2 * si + 1];
             g0 = g1;
             w0 = w1;
+            z0 = z1;
           }
           // Its floodplain (and active belt): a flat valley floor where it has room.
           if (Math.max(st.plain0, st.plain1, st.belt0, st.belt1) >= 1.5) stampFloodplain(st, nCarve, Wg, Hg);
@@ -2717,7 +2838,7 @@ let streamY1 = -1;
  * stretches overlap: max), with its glacial trough's depth and fjord weight
  * (g0, w0 at the first point, g1, w1 at the second) where it is highest.
  */
-function stampCarve(x0: number, y0: number, x1: number, y1: number, V: number, wet: number, Wg: number, Hg: number, g0 = 0, g1 = 0, w0 = 0, w1 = 0): void {
+function stampCarve(x0: number, y0: number, x1: number, y1: number, V: number, wet: number, Wg: number, Hg: number, g0 = 0, g1 = 0, w0 = 0, w1 = 0, z0 = Infinity, z1 = Infinity): void {
   const minX = Math.max(0, Math.floor(Math.min(x0, x1) - V));
   const maxX = Math.min(Wg - 1, Math.ceil(Math.max(x0, x1) + V));
   const minY = Math.max(0, Math.floor(Math.min(y0, y1) - V));
@@ -2753,6 +2874,7 @@ function stampCarve(x0: number, y0: number, x1: number, y1: number, V: number, w
         STREAM[p] = c;
         STREAM_G[p] = g0 + (g1 - g0) * t;
         STREAM_F[p] = w0 + (w1 - w0) * t;
+        STREAM_Z[p] = z0 + (z1 - z0) * t;
       }
       const g = wet * (d < 0.55 ? 1 : (1 - d) / 0.45);
       if (g > RIPARIAN[p]) RIPARIAN[p] = g;
@@ -2777,6 +2899,8 @@ function mergeStream(Wg: number): void {
         CDOM[p] = c;
         GLAC[p] = STREAM_G[p];
         FJW[p] = STREAM_F[p];
+        // (And its bed: a tributary keeps its own until the trunk's valley takes over.)
+        BEDZ[p] = STREAM_Z[p];
       }
       STREAM[p] = 0;
     }
@@ -2849,7 +2973,8 @@ function rasterNetworks(md: MeshData, f: FieldData, L: number, x0g: number, y0g:
     let reachR = 0;
     for (let b = 0; b < NET_BINS; b++) reachR = Math.max(reachR, f.netFront[NET_BINS * n + b]);
     // (Gnomonic distance r is tan of the angle; a little beyond for ragged shores.)
-    tileCos[tileNetN] = Math.cos(Math.min(1.5, Math.atan(reachR) + 2000 / R));
+    const ragN = netInfo[NET_INFO * n] === 0 ? 1.3 * deltaRag(netInfo[NET_INFO * n + 5], netInfo[NET_INFO * n + 2]) : 0;
+    tileCos[tileNetN] = Math.cos(Math.min(1.5, Math.atan(reachR) + Math.max(2000 / R, ragN)));
     tileNets[tileNetN++] = n;
     const s0 = netStart[n];
     const s1 = netStart[n + 1];
@@ -2934,9 +3059,13 @@ function rasterNetworks(md: MeshData, f: FieldData, L: number, x0g: number, y0g:
         // Banks a little wider than the channel on the ground (a channel
         // width or so either side), never narrower than the drawn channel;
         // tapering out toward the mouth.
-        const bank = (wM: number): number => (0.5 * wM + Math.min(1500, 250 + 0.5 * wM)) / mPerPx;
+        // A bird's foot's passes run out to sea between strips of levee land
+        // and marsh several channel widths wide (the Mississippi's fingers are
+        // a few kilometres across), narrowing toward their tips.
+        const birdfoot = netInfo[io + 1] === 0;
+        const bank = (wM: number): number => (0.5 * wM + (birdfoot ? Math.max(700, Math.min(4500, 3 * wM)) : Math.min(1500, 250 + 0.5 * wM))) / mPerPx;
         const lv0 = Math.max(hA + 0.8, bank(netW[pg]));
-        const lv1 = Math.max(hB + 0.8, bank(netW[g])) * (netMouth[g] === 1 ? 0.55 : 1);
+        const lv1 = Math.max(hB + 0.8, bank(netW[g])) * (netMouth[g] === 1 ? (birdfoot ? 0.6 : 0.55) : 1);
         for (let s = 1; s < nS; s++) {
           const u0 = (s - 1) / (nS - 1);
           const u1 = s / (nS - 1);
@@ -3146,8 +3275,13 @@ function fastAtan2(y: number, x: number): number {
   return y < 0 ? -t : t;
 }
 
-/** Which of the tile's networks holds unit vector p (see netHit); `slack` (radians) extends shorelines outward. */
-function netAt(f: FieldData, px: number, py: number, pz: number, slack: number): void {
+/** How far (radians) a sea delta of radius `radius` (radians) has its shoreline roughened either way, by its wave energy. */
+function deltaRag(radius: number, wave: number): number {
+  return Math.max(1500 / 6371000, (0.07 - 0.045 * wave) * radius);
+}
+
+/** Which of the tile's networks holds unit vector p (see netHit); `slack` (radians) extends shorelines outward (and a delta's ragged shore its own way). */
+function netAt(f: FieldData, px: number, py: number, pz: number, slack0: number): void {
   netHit = -1;
   const { netFrame, netTheta, netFront } = f;
   for (let k = 0; k < tileNetN; k++) {
@@ -3165,6 +3299,8 @@ function netAt(f: FieldData, px: number, py: number, pz: number, slack: number):
     const b = Math.min(NET_BINS - 2, Math.floor(a));
     const Rf = netFront[NET_BINS * n + b] + (netFront[NET_BINS * n + b + 1] - netFront[NET_BINS * n + b]) * (a - b);
     const r = Math.hypot(u, v);
+    const io = NET_INFO * n;
+    const slack = f.netInfo[io] === 0 ? Math.max(slack0, 1.2 * deltaRag(f.netInfo[io + 5], f.netInfo[io + 2])) : slack0;
     if (r >= Rf + slack) continue;
     netHit = n;
     netRho = r / Math.max(Rf, 1e-9);
@@ -3451,10 +3587,20 @@ export function renderWindow(ctx: RenderContext, opt: RenderOptions, win: PixelW
           dRho = netRho;
           dGap = netGap / dRad;
           const io = NET_INFO * netHit;
-          if (f.netInfo[io] === 0 && netFirm > 0.5) {
+          // (Its flanks keep to the coast along each bearing, so no firmness
+          // cut-off is needed there: one would draw them as straight rays.)
+          if (f.netInfo[io] === 0) {
+            // A shoreline as ragged as any other coast at the delta's own
+            // scale: lobes, mouth bars and bays between its distributaries a
+            // few hundredths of its size (fewer where waves smooth it), and
+            // finer coves as you zoom; not a smooth curve drawn out to sea.
             // (The ragged edge only matters near the shoreline.)
-            const amp = netSlack * (1 - 0.6 * f.netInfo[io + 2]);
-            deltaLand = netGap > amp ? true : netGap + amp * 0.5 * raggedEdge(noise, px, py, pz, f0 * 3, K) > 0;
+            const amp = deltaRag(f.netInfo[io + 5], f.netInfo[io + 2]);
+            // (Broad, smooth lobes, and only the fine raggedness of any coast on
+            // top: a front of lobes and bays, not a spray of islets off it.)
+            const fN = Math.max(f0 * 1.1, 2.4 / Math.max(f.netInfo[io + 5], 1e-6));
+            const lob = netGap > 1.2 * amp ? 0 : noise.noise(px * fN + 11.3, py * fN - 7.7, pz * fN + 3.1) + 0.45 * noise.noise(px * fN * 2.1 - 5.1, py * fN * 2.1 + 9.3, pz * fN * 2.1 - 1.7);
+            deltaLand = netGap > 1.2 * amp ? true : netGap + 0.55 * amp * lob + 0.5 * netSlack * raggedEdge(noise, px, py, pz, f0 * 3, K) > 0;
           }
         }
         if (LEVEE[p] > 0.5) deltaLand = true;
@@ -3477,10 +3623,11 @@ export function renderWindow(ctx: RenderContext, opt: RenderOptions, win: PixelW
       if (dNet >= 0 && f.netInfo[NET_INFO * dNet] === 0) plainW = !meshLand ? 1 : Math.max(plainW, Math.min(1, LEVEE[p]));
       if (isLand && !meshLand) {
         // Delta plain built out over the sea: just above it, highest toward the apex.
-        S = 0.5 + 1.8 * (1 - Math.min(1, dRho)) ** 2;
+        S = 0.5 + 1.8 * (1 - Math.min(1, dRho)) ** 2 + 0.6 * Math.min(1, LEVEE[p]);
         e = S + 0.35 * Dn;
       } else if (isLand) {
         S = seL / swL;
+        surfBed = BEDZ[p];
         const dry = landSurface(noise, px, py, pz, h, R, A, Dn, CARVE[p], S, sIce / swL, sCov / swL, sCov > 0 ? sIce / sCov : 0, GLAC[p], FJW[p], sLake / sw, swO / sw, K);
         let e0 = surfE;
         flags = surfFlags;
@@ -3506,7 +3653,9 @@ export function renderWindow(ctx: RenderContext, opt: RenderOptions, win: PixelW
           // unless the cells themselves lie below it (a closed depression): a
           // soft floor, so low plains level out gradually wherever they are
           // (a floor only near the coast left a stepped arc where it ended).
-          const floor = Math.min(S, 0.5);
+          // (A delta's plain, the bays it silted up among it, lies at or above
+          // the sea whatever the planes of the higher ground beside it say.)
+          const floor = sNet > 0.5 * swL ? 0.5 : Math.min(S, 0.5);
           const dFl = e0 - floor;
           e0 = floor + 0.5 * (dFl + Math.sqrt(dFl * dFl + 2.25));
           e = e0;
@@ -3616,7 +3765,13 @@ export function renderWindow(ctx: RenderContext, opt: RenderOptions, win: PixelW
           // elongated, lobed outline), the same at every zoom; from afar those
           // under about a pixel and a half are left out whole, never drawn as
           // specks.
-          const density = (kind === 2 ? 0.5 : 0.04 + 0.26 * smooth01((dRho - 0.45) / 0.4)) * wet * smooth01((plainW - 0.6) / 0.3);
+          // Clustered, not sprinkled evenly: backswamps and flooded lows some
+          // tens of kilometres across hold them, the higher ground between
+          // has few or none.
+          const fcl = R / 26000;
+          const cl0 = noise.noise(px * fcl - 61.3, py * fcl + 17.9, pz * fcl + 44.1) + 0.5 * noise.noise(px * fcl * 2.3 + 8.1, py * fcl * 2.3 - 3.7, pz * fcl * 2.3 + 91.2);
+          const cluster = 2.4 * smooth01((cl0 + 0.05) / 0.7);
+          const density = (kind === 2 ? 0.5 : 0.04 + 0.26 * smooth01((dRho - 0.45) / 0.4)) * wet * smooth01((plainW - 0.6) / 0.3) * cluster;
           if (density > 0.005) {
             // (The pixel's own longitude, from its column.)
             let lon = -Math.PI + (x0g + i + 0.5) * dRad;

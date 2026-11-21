@@ -56,6 +56,29 @@ export interface Climate {
   zonalT: Float64Array;
 }
 
+/**
+ * Extra albedo of high-latitude land through the sunlit season. Under a low
+ * sun the winter's snow lingers deep into summer, and polar summers are
+ * cloudy, so land beyond the polar circles absorbs a smaller share of its
+ * long days' sunshine. Earth's polar lands peak at 0–8 °C in their warmest
+ * month despite 24-hour daylight, while the continental response alone would
+ * give a dark polar interior Siberian summers.
+ */
+const POLAR_LAND_ALBEDO = 0.2;
+const POLAR_LAND_FROM = 62;
+const POLAR_LAND_FULL = 85;
+
+/** Albedo the seasonal cycle of sunshine meets (low sun and clouds toward the poles). */
+export function seasonalAlbedo(lat: number): number {
+  const s = Math.sin(lat);
+  return 0.32 + 0.1 * s * s;
+}
+
+/** The same over land, which keeps its snow into the summer near the poles. */
+export function landSeasonalAlbedo(lat: number): number {
+  return seasonalAlbedo(lat) + POLAR_LAND_ALBEDO * smoothstep(POLAR_LAND_FROM, POLAR_LAND_FULL, Math.abs(lat) / DEG);
+}
+
 /** Daily-mean top-of-atmosphere insolation (W/m²). */
 export function insolation(lat: number, decl: number): number {
   const t = -Math.tan(lat) * Math.tan(decl);
@@ -496,8 +519,8 @@ export function computeClimate(mesh: SphereMesh, elev: Float32Array, land: Float
   for (let c = 0; c < n; c++) {
     const j = bandOf(lat[c]);
     const phi = lat[c];
-    const s = Math.sin(phi);
-    const albedo = 0.32 + 0.1 * s * s;
+    const albedo = seasonalAlbedo(phi);
+    const albedoLand = landSeasonalAlbedo(phi);
     const m = Math.min(1, maritime[c]);
     // Snowy high-latitude interiors radiate heat away in winter: colder annual means.
     const interior = land[c] > 0.5 ? -3.5 * (1 - m) * Math.max(0, Math.min(1, (Math.abs(phi / DEG) - 20) / 40)) : 0;
@@ -512,14 +535,14 @@ export function computeClimate(mesh: SphereMesh, elev: Float32Array, land: Float
       // and the land's own the rest: blending the responses, not the heat
       // capacities (which would let a little sea air flatten a whole continent's
       // seasons), keeps continental summers hot and winters cold.
-      const resp = (cap: number): [number, number] => {
+      const resp = (cap: number, alb: number): [number, number] => {
         const br = B_EFF;
         const bi = k * OMEGA * cap;
         const den = br * br + bi * bi;
-        return [((1 - albedo) * br) / den, (-(1 - albedo) * bi) / den];
+        return [((1 - alb) * br) / den, (-(1 - alb) * bi) / den];
       };
-      const [or, oi] = resp(C_OCEAN);
-      const [lr, li] = resp(C_LAND);
+      const [or, oi] = resp(C_OCEAN, albedo);
+      const [lr, li] = resp(C_LAND, albedoLand);
       const hr = m * or + (1 - m) * lr;
       const hi = m * oi + (1 - m) * li;
       const qr = Qre[k - 1][j];

@@ -1,8 +1,9 @@
 import { smoothstep } from '../core/math';
 import type { SphereMesh } from '../core/mesh';
+import { Simplex3 } from '../core/noise';
 import { seedFor } from '../core/rng';
 import { Channel, type DeltaForm } from '../world/channels';
-import { MAX_GLACIAL_EROSION } from '../world/glaciers';
+import { ICE_ISOSTASY, MAX_GLACIAL_EROSION } from '../world/glaciers';
 import { Deposit } from '../world/sediment';
 import type { World } from '../world/world';
 
@@ -160,6 +161,10 @@ export interface FieldData {
    */
   rivDist: Float32Array;
   rivTau: Float32Array;
+  /** Bed height (m) at each chain node, never rising downstream (see riverBeds). */
+  rivBed: Float32Array;
+  /** Per chain: how far up the trunk's last stretch it joins, as a share of that stretch (see staggerJunctions). */
+  rivStag: Float32Array;
   /**
    * 0–1 at each node: how braided (1; wandering 0.45) and how anastomosing
    * the river is, averaged over several nodes so its belt opens and closes
@@ -414,7 +419,7 @@ export const CHANNEL_WIDTH = 4;
 export const MEANDER_WAVE = 12;
 
 type RiverFields =
-  | 'rivStart' | 'rivCell' | 'rivQ' | 'rivBank' | 'rivWave' | 'rivFlow' | 'rivSea' | 'rivNext' | 'rivRun' | 'rivJoin' | 'rivOrder' | 'rivCoast' | 'rivBox'
+  | 'rivStart' | 'rivCell' | 'rivQ' | 'rivBank' | 'rivWave' | 'rivFlow' | 'rivSea' | 'rivNext' | 'rivRun' | 'rivJoin' | 'rivOrder' | 'rivCoast' | 'rivBox' | 'rivStag'
   | 'rivPattern' | 'rivThreads' | 'rivSinu' | 'rivBelt' | 'rivPlain' | 'rivGrain' | 'rivBars' | 'rivConf' | 'rivDist' | 'rivTau' | 'rivBraid' | 'rivAnas';
 
 /**
@@ -757,8 +762,181 @@ function buildRivers(world: World): Pick<FieldData, RiverFields> {
     rivOrder: Int32Array.from(order),
     rivCoast: coast,
     rivBox: box,
+    rivStag: staggerJunctions(mesh, start, cells, join),
     ...channelStyle(world, start, cells, srcs, banks),
   };
+}
+
+/**
+ * Per chain: how far up the trunk's last stretch before their shared node (0–0.6
+ * of it) a tributary joins, when several tributaries reach the trunk at one
+ * node. Rivers rarely meet three at a point: the one arriving farthest
+ * downstream joins at the node, the others at points spread up the trunk in
+ * the order they arrive, each curving in at an acute angle.
+ */
+function staggerJunctions(mesh: SphereMesh, start: number[], cells: number[], join: Int32Array): Float32Array {
+  const { x, y, z } = mesh;
+  const nChains = start.length - 1;
+  const stag = new Float32Array(nChains);
+  const nodeChain = new Int32Array(cells.length);
+  for (let ch = 0; ch < nChains; ch++) nodeChain.fill(ch, start[ch], start[ch + 1]);
+  const atNode = new Map<number, number[]>();
+  for (let ch = 0; ch < nChains; ch++) {
+    const j = join[ch];
+    if (j < 0) continue;
+    const list = atNode.get(j);
+    if (list) list.push(ch);
+    else atNode.set(j, [ch]);
+  }
+  for (const [j, chs] of atNode) {
+    if (chs.length < 2 || j === start[nodeChain[j]]) continue;
+    const r = cells[j];
+    const up = cells[j - 1];
+    let dx = x[r] - x[up];
+    let dy = y[r] - y[up];
+    let dz = z[r] - z[up];
+    const l = Math.hypot(dx, dy, dz) || 1;
+    dx /= l;
+    dy /= l;
+    dz /= l;
+    const keyed = chs.map((ch) => {
+      const c = cells[start[ch + 1] - 2];
+      return { ch, along: (x[c] - x[r]) * dx + (y[c] - y[r]) * dy + (z[c] - z[r]) * dz };
+    });
+    keyed.sort((a, b) => a.along - b.along);
+    const m = keyed.length;
+    for (let t = 0; t < m; t++) stag[keyed[t].ch] = Math.min(0.6, 0.22 * (m - 1 - t));
+  }
+  return stag;
+}
+
+/** Bed samples per river segment (see riverBeds). */
+export const BED_SAMPLES = 6;
+
+/**
+ * A river's bed (m) at BED_SAMPLES points along each segment (node k to k+1,
+ * at u = s / BED_SAMPLES; the chain's last node holds only its first): the
+ * level the renderer's valley floor takes there (the surface the water runs
+ * down, sunk into the broad hollows of the sub-cell relief the course crosses,
+ * the same rule as raster.ts landSurface, and into glacial troughs), at the
+ * sea's or a lake's level at a wet end, and never rising downstream: a
+ * river cuts down through a spur or a rise in the ground instead of climbing
+ * over it, and stays below the hollows beside it.
+ */
+function riverBeds(world: World, riv: Pick<FieldData, RiverFields>, ocean: Uint8Array, elev: Float32Array, grad: Float32Array, amp: Float32Array, mtn: Float32Array, glac: Float32Array, noiseSeed: number): Float32Array {
+  const { rivStart, rivCell } = riv;
+  const { fill } = world.hydro.routing;
+  const { lake, lakes } = world.hydro;
+  const { x, y, z, nbrStart, nbr } = world.fine;
+  const iceH = world.ice.thick;
+  const kr2 = (KERNEL_RADIUS * world.fine.spacing) ** 2;
+  // (The renderer blends its cells within its kernel: two rings around each end of the segment.)
+  const mark = new Int32Array(world.fine.n).fill(-1);
+  const near: number[] = [];
+  const collect = (c: number, tag: number): void => {
+    const add = (q: number): void => {
+      if (mark[q] === tag) return;
+      mark[q] = tag;
+      near.push(q);
+    };
+    add(c);
+    for (let k = nbrStart[c]; k < nbrStart[c + 1]; k++) {
+      const m = nbr[k];
+      add(m);
+      for (let j = nbrStart[m]; j < nbrStart[m + 1]; j++) add(nbr[j]);
+    }
+  };
+  const noise = new Simplex3(noiseSeed);
+  const f0 = 0.75 / world.fine.spacing;
+  /** The two coarsest octaves of the renderer's sub-cell relief at p (raster.ts subcellRelief's reliefLow). */
+  const reliefLow = (px: number, py: number, pz: number, M: number): number => {
+    const gain = 0.52 + 0.13 * M;
+    const crest = M > 0.02 ? 0.6 + 0.45 * noise.noise(px * f0 * 1.7 - 47.1, py * f0 * 1.7 + 13.9, pz * f0 * 1.7 + 88.3) : 1;
+    let s = 0;
+    let a = 1;
+    let fr = f0;
+    let wgt = 1;
+    for (let k = 0; k < 2; k++) {
+      let v = noise.noise(px * fr + 17.3 * k, py * fr - 9.1 * k, pz * fr + 5.7 * k);
+      if (M > 0.02) {
+        const r = 1 - Math.abs(v);
+        const sig = r * r * wgt * (k === 0 ? crest : 1);
+        wgt = Math.max(0.35, Math.min(1, sig * 2));
+        v += (2.2 * (sig - 0.42) - v) * M;
+      }
+      s += a * v;
+      a *= gain;
+      fr *= 2;
+    }
+    return (s * 0.5 * Math.sqrt(1 - gain * gain)) / 0.3;
+  };
+  const nNodes = rivCell.length;
+  const bed = new Float32Array(nNodes * BED_SAMPLES).fill(Infinity);
+  const wet = (c: number): number => (world.ocean[c] ? 0 : lake[c] >= 0 ? lakes[lake[c]].level : NaN);
+  for (let ch = 0; ch < rivStart.length - 1; ch++) {
+    let prev = Infinity;
+    for (let i = rivStart[ch]; i < rivStart[ch + 1]; i++) {
+      const a = rivCell[i];
+      const last = i === rivStart[ch + 1] - 1;
+      const b = last ? a : rivCell[i + 1];
+      near.length = 0;
+      collect(a, i);
+      collect(b, i);
+      for (let s = 0; s < (last ? 1 : BED_SAMPLES); s++) {
+        const u = s / BED_SAMPLES;
+        const wa = wet(a);
+        let v: number;
+        if (s === 0 && !Number.isNaN(wa)) v = wa;
+        else {
+          let px = x[a] + (x[b] - x[a]) * u;
+          let py = y[a] + (y[b] - y[a]) * u;
+          let pz = z[a] + (z[b] - z[a]) * u;
+          const l = Math.hypot(px, py, pz) || 1;
+          px /= l;
+          py /= l;
+          pz /= l;
+          // The renderer's blend at this point: relief, mountains, lakes and the land surface.
+          let sw = 0;
+          let sA = 0;
+          let sM = 0;
+          let sL = 0;
+          let swL = 0;
+          let sS = 0;
+          let sI = 0;
+          for (const q of near) {
+            const dx = px - x[q];
+            const dy = py - y[q];
+            const dz = pz - z[q];
+            const d2 = dx * dx + dy * dy + dz * dz;
+            if (d2 >= kr2) continue;
+            let w = 1 - d2 / kr2;
+            w *= w;
+            sw += w;
+            sA += w * amp[q];
+            sM += w * mtn[q];
+            if (ocean[q]) continue;
+            swL += w;
+            sS += w * (elev[q] + grad[3 * q] * dx + grad[3 * q + 1] * dy + grad[3 * q + 2] * dz);
+            sI += w * iceH[q];
+            if (lake[q] >= 0) sL += w;
+          }
+          if (sw <= 0 || swL <= 0) {
+            prev = Math.min(prev, fill[b]);
+            bed[i * BED_SAMPLES + s] = prev;
+            continue;
+          }
+          const A = (sA / sw) * (1 - sL / sw) ** 2;
+          const M = sM / sw;
+          const ground = sS / swL - (1 - ICE_ISOSTASY) * (sI / swL);
+          const trough = glac[i] + ((last ? glac[i] : glac[i + 1]) - glac[i]) * u;
+          v = ground - 4 - A * Math.max(0.3, 0.25 - reliefLow(px, py, pz, M)) - trough;
+        }
+        prev = Math.min(prev, v);
+        bed[i * BED_SAMPLES + s] = prev;
+      }
+    }
+  }
+  return bed;
 }
 
 /** Ice-age deepening (m, a cell's average) below which a valley shows no glacial trough. */
@@ -1242,16 +1420,85 @@ function lakeWetField(world: World): Float32Array {
   return wet;
 }
 
+/**
+ * Sea that delta plains have silted up (channels.fill), drawn as land: the
+ * ocean mask without those cells, and for each of them the nearest land cell
+ * to take its plain's ground, colour and attributes from.
+ */
+function deltaFill(world: World): { ocean: Uint8Array; cells: number[]; donor: Int32Array } | null {
+  const fill = world.channels?.fill;
+  if (!fill) return null;
+  const { nbrStart, nbr } = world.fine;
+  const cells: number[] = [];
+  for (let c = 0; c < fill.length; c++) if (fill[c] && world.ocean[c]) cells.push(c);
+  if (cells.length === 0) return null;
+  const ocean = Uint8Array.from(world.ocean);
+  for (const c of cells) ocean[c] = 0;
+  // Out from the old coast across the filled cells: each takes the land it is reached from.
+  const donor = new Int32Array(fill.length).fill(-1);
+  let front: number[] = [];
+  for (const c of cells) {
+    for (let k = nbrStart[c], e = nbrStart[c + 1]; k < e; k++) {
+      if (!world.ocean[nbr[k]]) {
+        donor[c] = nbr[k];
+        front.push(c);
+        break;
+      }
+    }
+  }
+  while (front.length) {
+    const next: number[] = [];
+    for (const c of front) {
+      for (let k = nbrStart[c], e = nbrStart[c + 1]; k < e; k++) {
+        const m = nbr[k];
+        if (donor[m] >= 0 || !fill[m] || !world.ocean[m]) continue;
+        donor[m] = donor[c];
+        next.push(m);
+      }
+    }
+    front = next;
+  }
+  // (A pocket reached from no land, cut off behind the delta's own built-out
+  // shoreline, takes its apex's ground; one with neither stays sea.)
+  const nets = world.channels!.networks;
+  for (const c of cells) {
+    if (donor[c] >= 0) continue;
+    const o = world.channels!.networkOf[c];
+    const a = o >= 0 ? nets[o].apex : -1;
+    if (a >= 0 && !world.ocean[a]) donor[c] = a;
+  }
+  const kept = cells.filter((c) => donor[c] >= 0);
+  for (const c of cells) if (donor[c] < 0) ocean[c] = 1;
+  return { ocean, cells: kept, donor };
+}
+
 export function buildFields(world: World, meshId: string, version: number): FieldData {
   const mesh = world.fine;
   const n = mesh.n;
-  const { ocean, geo } = world;
-  const elev = atollsSubmerged(mesh, world.elev, world.relief.reef);
+  const { geo } = world;
+  const filled = deltaFill(world);
+  const ocean = filled ? filled.ocean : world.ocean;
+  /** A per-cell array with the silted-up sea taking its donor land's values (`stride` values per cell). */
+  const fromDonor = <T extends Uint8Array | Int32Array | Float32Array>(a: T, stride = 1): T => {
+    if (!filled) return a;
+    const o = a.slice() as T;
+    for (const c of filled.cells) for (let s = 0; s < stride; s++) o[c * stride + s] = a[filled.donor[c] * stride + s];
+    return o;
+  };
+  let elev = atollsSubmerged(mesh, world.elev, world.relief.reef);
+  if (filled) {
+    if (elev === world.elev) elev = Float32Array.from(elev);
+    // A delta plain a metre or two above the sea, never higher than the plain it grew from.
+    for (const c of filled.cells) elev[c] = Math.max(0.6, Math.min(2, 0.5 + 0.3 * world.elev[filled.donor[c]]));
+  }
   const grad = limitedGradient(mesh, elev, ocean);
+  // (A silted-up bay is a dead-level plain: no slope down toward the sea floor it buried.)
+  if (filled) for (const c of filled.cells) grad[3 * c] = grad[3 * c + 1] = grad[3 * c + 2] = 0;
   const amp = new Float32Array(n);
   const mtn = new Float32Array(n);
   const rough = world.relief.rough;
-  const depKind = world.deposits.kind;
+  const depKind = world.deposits.kind.slice();
+  if (filled) for (const c of filled.cells) depKind[c] = Deposit.Delta;
   const h = mesh.spacing;
   for (let c = 0; c < n; c++) {
     const g = Math.hypot(grad[3 * c], grad[3 * c + 1], grad[3 * c + 2]) * h;
@@ -1267,6 +1514,8 @@ export function buildFields(world: World, meshId: string, version: number): Fiel
     amp[c] = Math.hypot((rough[c] + 15) * (BURIED_RELIEF[depKind[c]] ?? 1) + 450 * mtn[c], 0.2 * g);
   }
   const rivers = buildRivers(world);
+  const noiseSeed = seedFor(world.params.seed, 'detail');
+  const troughs = glacialTroughs(world, rivers, elev, amp);
   const plateColor = new Uint8Array(geo.plates.length * 3);
   geo.plates.forEach((p, i) => plateColor.set(p.color, 3 * i));
   const hydro = world.hydro;
@@ -1274,6 +1523,14 @@ export function buildFields(world: World, meshId: string, version: number): Fiel
   for (let c = 0; c < n; c++) {
     const pet = world.water.petYear[c];
     if (!ocean[c] && pet > 0) dryness[c] = Math.max(0, Math.min(1, 1 - world.precipYear[c] / pet));
+  }
+  if (filled) {
+    for (const c of filled.cells) {
+      dryness[c] = dryness[filled.donor[c]];
+      // (A dead-level plain: the sea floor it buried keeps none of its roughness.)
+      amp[c] = 15 * (BURIED_RELIEF[Deposit.Delta] ?? 1);
+      mtn[c] = 0;
+    }
   }
   const ice = world.ice;
   const iceMelt = new Float32Array(n);
@@ -1296,7 +1553,7 @@ export function buildFields(world: World, meshId: string, version: number): Fiel
   return {
     meshId,
     version,
-    noiseSeed: seedFor(world.params.seed, 'detail'),
+    noiseSeed,
     radiusKm: world.params.radiusKm,
     riverThreshold: world.params.riverThreshold,
     elev,
@@ -1317,25 +1574,26 @@ export function buildFields(world: World, meshId: string, version: number): Fiel
     fjord,
     strand: strandflats(world, fjord, elev),
     reef: world.relief.reef,
-    color: world.biomes.color,
-    biome: world.biomes.biome,
-    koppen: world.biomes.koppen,
-    rock: world.lithology.rock,
-    deposit: world.deposits.kind,
-    soil: world.soils.order,
-    fertility: world.soils.fertility,
-    saline: world.soils.saline,
+    color: fromDonor(world.biomes.color, 3),
+    biome: fromDonor(world.biomes.biome),
+    koppen: fromDonor(world.biomes.koppen),
+    rock: fromDonor(world.lithology.rock),
+    deposit: depKind,
+    soil: fromDonor(world.soils.order),
+    fertility: fromDonor(world.soils.fertility),
+    saline: fromDonor(world.soils.saline),
     plate: geo.plate,
     plateColor,
     ctype: geo.ctype,
     thick: geo.thick,
     age: geo.age,
     bndType: world.bnd.type,
-    drainage: hydro.drainage,
+    drainage: fromDonor(hydro.drainage),
     temp: world.temp,
     precip: world.precip,
     ...rivers,
-    ...glacialTroughs(world, rivers, elev, amp),
+    ...troughs,
+    rivBed: riverBeds(world, rivers, ocean, elev, grad, amp, mtn, troughs.rivGlac, noiseSeed),
     ...buildNetworks(world, rivers),
   };
 }

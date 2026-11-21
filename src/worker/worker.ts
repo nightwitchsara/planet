@@ -431,7 +431,10 @@ function inspect(w: World, lat: number, lon: number): InspectInfo {
   const h = w.hydro;
   const lk = h.lake[c] >= 0 ? h.lakes[h.lake[c]] : null;
   // Delta land the map builds out past the cells' coast is land, not sea.
-  const built = w.ocean[c] ? builtDeltaAt(w, v) : null;
+  let built = w.ocean[c] ? builtDeltaAt(w, v) : null;
+  // (And the bays and shallows a delta has silted up, drawn as its plain.)
+  const ch = w.channels;
+  if (!built && w.ocean[c] && ch?.fill[c] && ch.networkOf[c] >= 0) built = { net: ch.networks[ch.networkOf[c]], rho: 0.9 };
   if (built) setting = `Delta plain built out into the sea, a few metres above it — ${describeNetwork(built.net)}`;
   const water = w.ocean[c] && !built ? 'ocean' : lk ? (lk.kind === LakeKind.Fresh ? 'lake' : lk.kind === LakeKind.Saline ? 'salt lake' : 'salt flat') : null;
   const lake = lk

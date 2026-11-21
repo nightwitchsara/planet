@@ -434,8 +434,25 @@ export function computeHydrology(
   /** Water that has passed through a lake (m³/s, mean): its floods are damped. */
   const settled = new Float64Array(n);
 
+  /** 1 = on glacier ice or beside it (its margin, drawn as ice or ragged with it). */
+  const nearIce = (c: number): number => {
+    if (wb.glacier[c]) return 1;
+    for (let k = mesh.nbrStart[c], e = mesh.nbrStart[c + 1]; k < e; k++) if (wb.glacier[mesh.nbr[k]]) return 1;
+    return 0;
+  };
   const settleLake = (g: number, outlet: number): void => {
-    const cells = pits[g];
+    // No lake on ice, nor one dammed by it: water meeting an ice sheet runs
+    // on over or beneath it, and a basin the ice dams drains under its dam
+    // (once deep enough to float the ice) long before it could brim over the
+    // top. A closed basin keeps its lake, on its ice-free ground.
+    const all = pits[g];
+    let iced = 0;
+    for (const c of all) iced += nearIce(c);
+    // (Dammed by ice: its way out runs onto the ice within a few cells.)
+    let dammed = false;
+    for (let c = outlet, k = 0; c >= 0 && k < 4 && !dammed; c = routing.receiver[c], k++) dammed = nearIce(c) === 1;
+    if (!closedG?.[g] && (dammed || iced > 0)) return;
+    const cells = all;
     const spill = spillOf[g];
     if (cells.length === 0 || spill - elev[cells[0]] < 3) return;
     const o = outlet * MONTHS;
@@ -577,6 +594,17 @@ export function computeHydrology(
   // through whichever of its outlets comes last.
   const shallow = new Uint8Array(groups);
   for (let g = 0; g < groups; g++) shallow[g] = pits[g].length === 0 || spillOf[g] - elev[pits[g][0]] < 3 ? 1 : 0;
+  // A hollow on or against an ice sheet holds no lake either (see settleLake):
+  // its water runs on through it to its spill and over or under the ice,
+  // instead of being pooled for a lake that never forms and lost there.
+  for (let b = 0; b < routing.basinSpill.length; b++) {
+    const g = groupOf[b];
+    if (shallow[g] || closedIn?.closed[g]) continue;
+    let iced = false;
+    for (let c = routing.basinSpill[b], k = 0; c >= 0 && k < 4 && !iced; c = routing.receiver[c], k++) iced = nearIce(c) === 1;
+    for (let j = 0; j < pits[g].length && !iced; j++) iced = nearIce(pits[g][j]) === 1;
+    if (iced) shallow[g] = 1;
+  }
   for (let i = count - 1; i >= 0; i--) {
     const c = order[i];
     const rc = receiver[c];

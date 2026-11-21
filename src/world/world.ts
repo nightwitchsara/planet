@@ -263,7 +263,9 @@ export class World {
     const glacial = glacialDeposits(fine, bed, past, legacy, eroded, R);
     const wind = aeolianDeposits(fine, this.coarse, this.f2c, this.climate, bed, ocean0, this.precipYear, wb0.petYear, tempYear, eroded, glacial, R);
     const tDeposits = performance.now() - tDep;
-    this.ice = simulateIce(fine, bed, oceanMask(fine, bed), { tempSL, precip, cool: null, precipFactor: 1 }, 0, R, true);
+    // Today's ice starts from the ice age's: sheets that can still feed
+    // themselves at their own height survive, the rest melt back.
+    this.ice = simulateIce(fine, bed, oceanMask(fine, bed), { tempSL, precip, cool: null, precipFactor: 1 }, 0, R, true, past.thick);
     this.bed = bed;
     const elev = new Float32Array(n);
     for (let c = 0; c < n; c++) elev[c] = bed[c] + (1 - ICE_ISOSTASY) * this.ice.thick[c];

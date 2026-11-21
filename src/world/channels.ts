@@ -123,6 +123,8 @@ export interface Channels {
   networkOf: Int32Array;
   /** Per cell: the channel's valley slope (m/m) its hydraulics were worked out on (see VALLEY_GRADE). */
   slope: Float32Array;
+  /** Per cell: 1 = sea a delta plain has silted up (a bay it filled, or shallows between deltas that grew together); `networkOf` names the delta. */
+  fill: Uint8Array;
 }
 
 export interface ChannelInputs {
@@ -441,11 +443,15 @@ export function computeChannels(mesh: SphereMesh, inp: ChannelInputs): Channels 
     if (k === Deposit.Outwash) braid *= 0.4;
     ratio[c] = potential / braid;
     // Glacial troughs and outwash: wide valley floors, braided valley trains.
-    const trough = inp.iceAgeErosion[c] > 30 || k === Deposit.Outwash || glacial[c] > 0.3;
+    // (A glacier upstream feeds a river its meltwater and gravel, but only
+    // ice that widened the valley, or the outwash it left, gives it a floor
+    // to braid across: below glaciers in narrow mountain valleys rivers run
+    // as confined torrents.)
+    const trough = inp.iceAgeErosion[c] > 30 || k === Deposit.Outwash;
     const rocky = k === Deposit.Bedrock || k === Deposit.Residual;
     const canyon = arid < 0.5 && inp.elev[c] > 700 && rough[c] > 70 && S > 6e-4 && (rocky || k === Deposit.Colluvium);
     const confined =
-      (S > TORRENT_SLOPE && !((k === Deposit.Outwash || glacial[c] > 0.3) && S < 0.03)) || (!trough && rough[c] > MOUNTAIN_ROUGH && S > 0.0025) || (rocky && S > 0.004 && !trough) || canyon;
+      (S > TORRENT_SLOPE && !(k === Deposit.Outwash && S < 0.03)) || (!trough && rough[c] > MOUNTAIN_ROUGH && S > 0.0025) || (rocky && S > 0.004 && !trough) || canyon;
     const w = wetland[c];
     const aggrading =
       (toMouth[c] < backwater[c] && Q >= 50) ||
@@ -510,6 +516,7 @@ export function computeChannels(mesh: SphereMesh, inp: ChannelInputs): Channels 
       }
     }
   });
+  const deltaFill = backfillDeltas(mesh, inp, networks, networkOf);
 
   // Geometry of each pattern.
   const threads = new Float32Array(n).fill(1);
@@ -586,13 +593,233 @@ export function computeChannels(mesh: SphereMesh, inp: ChannelInputs): Channels 
         F = 3 * B;
         break;
     }
+    // Room to braid: a multi-thread belt needs a valley floor at least as
+    // wide. Without sediment or ice to widen it, rugged ground leaves only a
+    // few channel widths between its slopes (fewer the more rugged), and a
+    // river too wide for its floor runs confined instead.
+    if (pattern[c] === Channel.Braided || pattern[c] === Channel.Wandering || pattern[c] === Channel.Anastomosing) {
+      const kd = kind[c];
+      const wideFloor = inp.iceAgeErosion[c] > 30 || kd === Deposit.Outwash || kd === Deposit.Alluvium || kd === Deposit.Fan || kd === Deposit.Lake || kd === Deposit.Delta;
+      const floorW = wideFloor ? Infinity : W * (2 + 40 * clamp01((1.6 * MOUNTAIN_ROUGH - rough[c]) / MOUNTAIN_ROUGH));
+      if (B > floorW) {
+        pattern[c] = Channel.Confined;
+        k = 1;
+        P = 1.05;
+        B = W;
+        F = 0;
+      }
+    }
     threads[c] = k;
     sinuosity[c] = P;
     belt[c] = B;
     floodplain[c] = F;
   }
 
-  return { pattern, threads, sinuosity, belt, floodplain, grain, banks, power, networks, networkOf, slope: grade };
+  return { pattern, threads, sinuosity, belt, floodplain, grain, banks, power, networks, networkOf, slope: grade, fill: deltaFill };
+}
+
+/** Deepest water (m) a delta silts up beside or behind itself: bays, drowned valleys, the shallows between neighbouring deltas. */
+const BACKFILL_DEPTH = 90;
+
+/**
+ * Sea that delta plains have silted up: the shallow bays and drowned valleys
+ * a delta encloses (a delta first fills its estuary, then builds out), and
+ * the shallows between deltas that nearly touch, which grow together into one
+ * coastal plain. A morphological closing (dilate, then erode) of the land and
+ * every delta's built-out plain over the shallow sea around each delta, by
+ * about half its size: concavities and gaps narrower than that fill, the
+ * open sea in front stays open. Marks the cells 1 and gives them to the
+ * nearest delta in `networkOf`.
+ */
+function backfillDeltas(mesh: SphereMesh, inp: ChannelInputs, networks: Distributaries[], networkOf: Int32Array): Uint8Array {
+  const { n, x, y, z, nbrStart, nbr, nbrDist } = mesh;
+  const Rkm = inp.radiusKm;
+  const { ocean, elev } = inp;
+  const s = mesh.spacing * Rkm;
+  const fill = new Uint8Array(n);
+  /** Per ocean cell near a delta: the closing radius (km, the largest of the deltas it is near), and that delta. */
+  const rAt = new Float32Array(n);
+  const owner = new Int32Array(n).fill(-1);
+  /** Ocean cells inside a delta's built-out shoreline (land for the closing). */
+  const built = new Uint8Array(n);
+  const region: number[] = [];
+  const mark = new Int32Array(n).fill(-1);
+  networks.forEach((net, i) => {
+    if (net.kind !== 'delta' || net.outline.length < 9) return;
+    const R0 = net.radiusKm;
+    // (Smaller than a cell's reach, a delta's plain is drawn from its own shoreline alone.)
+    if (R0 < 0.35 * s) return;
+    const r = Math.min(80, Math.max(0.6 * R0, 1.05 * s));
+    // Gnomonic frame at the apex, its axis toward the outline's middle (as the renderer sees it).
+    const ax = net.x[0];
+    const ay = net.y[0];
+    const az = net.z[0];
+    const ol = net.outline;
+    const K = ol.length / 3;
+    const mid = 3 * Math.floor(K / 2);
+    const dm = ol[mid] * ax + ol[mid + 1] * ay + ol[mid + 2] * az;
+    let ex = ol[mid] - dm * ax;
+    let ey = ol[mid + 1] - dm * ay;
+    let ez = ol[mid + 2] - dm * az;
+    const el = Math.hypot(ex, ey, ez) || 1;
+    ex /= el;
+    ey /= el;
+    ez /= el;
+    const fx = ay * ez - az * ey;
+    const fy = az * ex - ax * ez;
+    const fz = ax * ey - ay * ex;
+    const th: number[] = [];
+    const rr: number[] = [];
+    let rMax = 0;
+    for (let k = 0; k < K; k++) {
+      const d = ol[3 * k] * ax + ol[3 * k + 1] * ay + ol[3 * k + 2] * az;
+      const u = (ol[3 * k] * ex + ol[3 * k + 1] * ey + ol[3 * k + 2] * ez) / d;
+      const v = (ol[3 * k] * fx + ol[3 * k + 1] * fy + ol[3 * k + 2] * fz) / d;
+      th.push(Math.atan2(v, u));
+      rr.push(Math.hypot(u, v));
+      rMax = Math.max(rMax, Math.hypot(u, v));
+    }
+    if (th[0] > th[K - 1]) {
+      th.reverse();
+      rr.reverse();
+    }
+    const inside = (c: number): boolean => {
+      const d = x[c] * ax + y[c] * ay + z[c] * az;
+      if (d <= 0) return false;
+      const u = (x[c] * ex + y[c] * ey + z[c] * ez) / d;
+      const v = (x[c] * fx + y[c] * fy + z[c] * fz) / d;
+      const t = Math.atan2(v, u);
+      if (t < th[0] || t > th[K - 1]) return false;
+      let k = 0;
+      while (k < K - 2 && th[k + 1] < t) k++;
+      const f = th[k + 1] > th[k] ? (t - th[k]) / (th[k + 1] - th[k]) : 0;
+      return Math.hypot(u, v) < rr[k] + (rr[k + 1] - rr[k]) * Math.max(0, Math.min(1, f));
+    };
+    // The cells around it, out to its shoreline and a closing radius beyond.
+    const lim = Math.cos(Math.min(1.2, rMax + (1.5 * r) / Rkm));
+    const apexCell = nearestCell(mesh, ax, ay, az, net.apex);
+    const stack = [apexCell];
+    mark[apexCell] = i;
+    while (stack.length) {
+      const c = stack.pop()!;
+      if (ocean[c]) {
+        if (inside(c)) built[c] = 1;
+        else if (elev[c] > -BACKFILL_DEPTH && r > rAt[c]) {
+          if (rAt[c] === 0) region.push(c);
+          rAt[c] = r;
+          owner[c] = i;
+        }
+      }
+      for (let k = nbrStart[c], e = nbrStart[c + 1]; k < e; k++) {
+        const m = nbr[k];
+        if (mark[m] === i) continue;
+        mark[m] = i;
+        if (x[m] * ax + y[m] * ay + z[m] * az >= lim) stack.push(m);
+      }
+    }
+  });
+  if (region.length === 0) return fill;
+  // Dilate: distance (km) from land or built-out plain over the candidate shallows.
+  const solid = (c: number): boolean => !ocean[c] || built[c] === 1;
+  const dist = new Float32Array(n).fill(Infinity);
+  const heap = new MinHeap();
+  for (const c of region) {
+    for (let k = nbrStart[c], e = nbrStart[c + 1]; k < e; k++) {
+      if (!solid(nbr[k])) continue;
+      const d = nbrDist[k] * Rkm;
+      if (d < dist[c]) dist[c] = d;
+    }
+    if (dist[c] < Infinity) heap.push(dist[c], c);
+  }
+  while (heap.size) {
+    const [d, c] = heap.pop();
+    if (d > dist[c]) continue;
+    for (let k = nbrStart[c], e = nbrStart[c + 1]; k < e; k++) {
+      const m = nbr[k];
+      if (rAt[m] === 0 || built[m]) continue;
+      const dm = d + nbrDist[k] * Rkm;
+      if (dm < dist[m] && dm <= rAt[m]) {
+        dist[m] = dm;
+        heap.push(dm, m);
+      }
+    }
+  }
+  const dilated = (c: number): boolean => solid(c) || (rAt[c] > 0 && dist[c] <= rAt[c]);
+  // Erode: distance from the water left outside; what lies farther than the radius fills.
+  const out = new Float32Array(n).fill(Infinity);
+  for (const c of region) {
+    if (!dilated(c)) continue;
+    for (let k = nbrStart[c], e = nbrStart[c + 1]; k < e; k++) {
+      if (dilated(nbr[k])) continue;
+      const d = nbrDist[k] * Rkm;
+      if (d < out[c]) out[c] = d;
+    }
+    if (out[c] < Infinity) heap.push(out[c], c);
+  }
+  while (heap.size) {
+    const [d, c] = heap.pop();
+    if (d > out[c]) continue;
+    for (let k = nbrStart[c], e = nbrStart[c + 1]; k < e; k++) {
+      const m = nbr[k];
+      if (rAt[m] === 0 || !dilated(m) || solid(m)) continue;
+      const dm = d + nbrDist[k] * Rkm;
+      if (dm < out[m] && dm <= rAt[m]) {
+        out[m] = dm;
+        heap.push(dm, m);
+      }
+    }
+  }
+  for (const c of region) {
+    if (!dilated(c) || out[c] <= rAt[c]) continue;
+    fill[c] = 1;
+    networkOf[c] = owner[c];
+  }
+  return fill;
+}
+
+/** A binary min-heap of (key, value) pairs. */
+class MinHeap {
+  private k: number[] = [];
+  private v: number[] = [];
+  get size(): number {
+    return this.k.length;
+  }
+  push(key: number, val: number): void {
+    const { k, v } = this;
+    k.push(key);
+    v.push(val);
+    let i = k.length - 1;
+    while (i > 0) {
+      const p = (i - 1) >> 1;
+      if (k[p] <= k[i]) break;
+      [k[p], k[i]] = [k[i], k[p]];
+      [v[p], v[i]] = [v[i], v[p]];
+      i = p;
+    }
+  }
+  pop(): [number, number] {
+    const { k, v } = this;
+    const top: [number, number] = [k[0], v[0]];
+    const lk = k.pop()!;
+    const lv = v.pop()!;
+    if (k.length > 0) {
+      k[0] = lk;
+      v[0] = lv;
+      let i = 0;
+      for (;;) {
+        const l = 2 * i + 1;
+        const r = l + 1;
+        let m = i;
+        if (l < k.length && k[l] < k[m]) m = l;
+        if (r < k.length && k[r] < k[m]) m = r;
+        if (m === i) break;
+        [k[m], k[i]] = [k[i], k[m]];
+        [v[m], v[i]] = [v[i], v[m]];
+        i = m;
+      }
+    }
+    return top;
+  }
 }
 
 // ------------------------------------------------------------------ distributary networks
@@ -1069,7 +1296,11 @@ function buildNetworks(mesh: SphereMesh, inp: ChannelInputs, sh: Shared): Distri
       a2 += 0.5 * s * s * dth;
     }
     const needed = Math.max(0.15 * A, A - meshArea(cells));
-    const P0 = a2 > 0 ? (-a1 + Math.sqrt(a1 * a1 + 4 * a2 * needed)) / (2 * a2) : 0;
+    // (No longer than about its width where it leaves the coast: a delta
+    // squeezed out of a narrow mouth fills its estuary rather than jutting
+    // out to sea as a spike; see backfillDeltas.)
+    const P0max = 1.1 * r0 * (thHi - thLo) + 0.15 * spacingKm;
+    const P0 = Math.min(P0max, a2 > 0 ? (-a1 + Math.sqrt(a1 * a1 + 4 * a2 * needed)) / (2 * a2) : 0);
     for (let j = 0; j < base.r.length; j++) base.r[j] = front.r[j] + P0 * shape(front.theta(j));
     const R0 = base.at(0);
 
@@ -1269,9 +1500,13 @@ function buildNetworks(mesh: SphereMesh, inp: ChannelInputs, sh: Shared): Distri
       // Past the delta's flanks the shoreline is the coast it grew from; on
       // bearings closed to the sea it turns back to the coast at the edge of
       // the open ones.
+      // (Along each bearing, short of the coast that is there: an arc swung
+      // from the open range's edge would stand out over a bay as a straight-
+      // edged sheet of land, and an outline on the coast itself would leave
+      // slivers and islets past the drawn shoreline.)
       const thc = Math.max(thLo, Math.min(thHi, th));
       const edge = front.at(th > 0 ? spread : -spread);
-      const fl = thc !== th ? front.at(thc) : Math.abs(th) > spread ? Math.min(front.at(th), 1.2 * edge) : r;
+      const fl = thc !== th ? 0.85 * Math.min(front.at(th), front.at(thc)) : Math.abs(th) > spread ? 0.85 * Math.min(front.at(th), 1.2 * edge) : r;
       fr.xyz(fl * Math.cos(thc), fl * Math.sin(thc), tmp, 0);
       outline.push(tmp[0], tmp[1], tmp[2]);
     }

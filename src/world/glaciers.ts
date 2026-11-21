@@ -1,7 +1,7 @@
 import { MinHeap } from '../core/heap';
 import { smoothstep, sortByValueDesc } from '../core/math';
 import type { SphereMesh } from '../core/mesh';
-import { LAPSE, MONTHS } from './climate';
+import { landSeasonalAlbedo, LAPSE, MONTHS } from './climate';
 import { REFERENCE_CELLS } from './hydrology';
 import { DDF_ICE, DDF_SNOW, normCdf, positiveDegreeDays, SIGMA_T } from './waterBalance';
 
@@ -24,6 +24,32 @@ const ICE_PER_WATER = 1000 / 917;
 export const MAX_GLACIAL_EROSION = 350;
 /** Sea level at the last glacial maximum (m): shelves lay dry and ice grounded on them. */
 export const ICE_AGE_SEA_LEVEL = -120;
+/** Passes for ice inherited from the ice age to settle into today's climate. */
+const INHERITED_PASSES = 14;
+/**
+ * Albedo of a large ice sheet's snow-covered interior through the melt season
+ * (fresh snow 0.8–0.85). The sheet reflects most of the summer sun, so its
+ * summers are a fraction as warm as the bare ground's around it. The darker
+ * bare ice of the ablation zone near the margin is OWN_CLIMATE_EDGE's job.
+ */
+const ICE_ALBEDO = 0.8;
+/**
+ * Distance (km) in from the ice margin over which the sheet's own summer
+ * climate takes over. At the margin the dark bare ice of the ablation zone
+ * and warm air from the land around temper it, but cold air draining off the
+ * sheet still keeps a large sheet's edge cooler than bare ground (the share
+ * kept at the very edge).
+ */
+const OWN_CLIMATE_DIST = 100;
+const OWN_CLIMATE_EDGE = 0.4;
+/**
+ * Ice body area (km²) over which it makes its own climate. Only sheets
+ * hundreds of km across (Greenland's is 1.7 million km²) chill the air over
+ * them; ice caps the size of the ice-age Alps' sit in air carried in from the
+ * land around and melted back when the ice age ended.
+ */
+const OWN_BODY_FROM = 150e3;
+const OWN_BODY_FULL = 1e6;
 
 // Positive degree-days and snowfall share by monthly mean temperature, tabulated.
 const T_LO = -80;
@@ -54,13 +80,18 @@ export interface IceClimate {
   precipFactor: number;
 }
 
-/** Annual surface mass balance (m water equivalent) of a glacier surface at elevation s: snow that outlasts the melt, or ice lost. */
-export function massBalance(cl: IceClimate, c: number, s: number): number {
+/**
+ * Annual surface mass balance (m water equivalent) of a glacier surface at
+ * elevation s: snow that outlasts the melt, or ice lost. `season` scales the
+ * seasonal swing around the annual mean `mean` (below 1 over a bright ice sheet).
+ */
+export function massBalance(cl: IceClimate, c: number, s: number, season = 1, mean = 0): number {
   const drop = (LAPSE * Math.max(0, s)) / 1000 + (cl.cool ? cl.cool[c] : 0);
   let snow = 0;
   let pdd = 0;
   for (let m = 0; m < MONTHS; m++) {
-    const t = cl.tempSL[c * MONTHS + m] - drop;
+    const t0 = cl.tempSL[c * MONTHS + m];
+    const t = (season === 1 ? t0 : mean + season * (t0 - mean)) - drop;
     snow += cl.precip[c * MONTHS + m] * cl.precipFactor * lookup(SNOW_TABLE, t);
     pdd += lookup(PDD_TABLE, t);
   }
@@ -152,6 +183,12 @@ function plasticThickness(mesh: SphereMesh, bed: Float32Array, cover: Float32Arr
 /**
  * Steady-state ice cover. Cells above `seaLevel` on the bed count as land, so
  * an ice-age run (sea level −120 m) can ground ice on the dry shelves.
+ *
+ * `initial` is the ice the climate inherits (the last ice age's). Ice sheets
+ * keep themselves: their own height lifts their surface into colder air, so a
+ * sheet can outlast the climate that built it wherever its surface stays cold
+ * enough to feed it, as Greenland's does. Ice that cannot feed itself melts
+ * back over the passes. Without it, ice grows from bare ground.
  */
 export function simulateIce(
   mesh: SphereMesh,
@@ -161,6 +198,7 @@ export function simulateIce(
   seaLevel: number,
   radiusKm: number,
   withShelves: boolean,
+  initial: Float32Array | null = null,
 ): IceSheet {
   const { n, nbrStart, nbr, nbrDist, area } = mesh;
   const radiusM = radiusKm * 1000;
@@ -185,15 +223,135 @@ export function simulateIce(
   /** Cells whose surface changed in the latest pass (the rest keep their mass balance and receivers). */
   const changed = new Uint8Array(n);
   let first = true;
+  // Annual-mean sea-level air and how much of the summer warmth a bright ice surface keeps.
+  const mean = new Float32Array(n);
+  const iceSeason = new Float32Array(n);
+  for (let i = 0; i < nLand; i++) {
+    const c = cells[i];
+    let s = 0;
+    for (let m = 0; m < MONTHS; m++) s += cl.tempSL[c * MONTHS + m];
+    mean[c] = s / MONTHS;
+    iceSeason[c] = Math.min(1, (1 - ICE_ALBEDO) / (1 - landSeasonalAlbedo(mesh.lat[c])));
+  }
+
+  // How far each cell's ice makes its own climate: well inside a large body.
+  // Bare hollows the ice encloses lie in the sheet's own cold air too (and
+  // fill with its ice); only ice facing the sea or open land is margin.
+  const own = new Float32Array(n);
+  const seasonUsed = new Float32Array(n);
+  const bodyOf = new Int32Array(n);
+  const ring = new Int32Array(n);
+  const open = new Uint8Array(n);
+  const members: number[] = [];
+  const bodyStack: number[] = [];
+  const km2 = radiusKm * radiusKm;
+  const spacingKm = mesh.spacing * radiusKm;
+  const iced = (c: number) => (first ? thick[c] > 0 : cover[c] > 0);
+  const ownClimate = (): void => {
+    // Open land: ice-free ground joined to the sea over ice-free ground.
+    for (let i = 0; i < nLand; i++) {
+      const c = cells[i];
+      own[c] = 0;
+      bodyOf[c] = -1;
+      open[c] = 0;
+      if (iced(c)) continue;
+      for (let k = nbrStart[c], e = nbrStart[c + 1]; k < e; k++) {
+        if (!land[nbr[k]]) {
+          open[c] = 1;
+          bodyStack.push(c);
+          break;
+        }
+      }
+    }
+    while (bodyStack.length) {
+      const c = bodyStack.pop()!;
+      for (let k = nbrStart[c], e = nbrStart[c + 1]; k < e; k++) {
+        const m = nbr[k];
+        if (land[m] && !open[m] && !iced(m)) {
+          open[m] = 1;
+          bodyStack.push(m);
+        }
+      }
+    }
+    for (let i = 0; i < nLand; i++) {
+      const c0 = cells[i];
+      if (bodyOf[c0] >= 0 || !iced(c0)) continue;
+      members.length = 0;
+      bodyOf[c0] = c0;
+      bodyStack.push(c0);
+      let a = 0;
+      while (bodyStack.length) {
+        const c = bodyStack.pop()!;
+        members.push(c);
+        a += area[c] * (iced(c) ? (first ? 1 : cover[c]) : 1);
+        for (let k = nbrStart[c], e = nbrStart[c + 1]; k < e; k++) {
+          const m = nbr[k];
+          if (land[m] && bodyOf[m] < 0 && !open[m]) {
+            bodyOf[m] = c0;
+            bodyStack.push(m);
+          }
+        }
+      }
+      const big = smoothstep(OWN_BODY_FROM, OWN_BODY_FULL, a * km2);
+      if (big <= 0) continue;
+      // Rings in from the margin (the body's edge on the sea or open land), in km.
+      let front: number[] = [];
+      for (const c of members) {
+        ring[c] = -1;
+        for (let k = nbrStart[c], e = nbrStart[c + 1]; k < e; k++) {
+          const m = nbr[k];
+          if (!land[m] || open[m]) {
+            ring[c] = 0;
+            front.push(c);
+            break;
+          }
+        }
+      }
+      for (let r = 1; front.length; r++) {
+        const next: number[] = [];
+        for (const c of front) {
+          for (let k = nbrStart[c], e = nbrStart[c + 1]; k < e; k++) {
+            const m = nbr[k];
+            if (bodyOf[m] === c0 && ring[m] < 0) {
+              ring[m] = r;
+              next.push(m);
+            }
+          }
+        }
+        front = next;
+      }
+      for (const c of members) {
+        const inward = smoothstep(0, OWN_CLIMATE_DIST, (Math.max(0, ring[c]) + 0.5) * spacingKm);
+        own[c] = big * (OWN_CLIMATE_EDGE + (1 - OWN_CLIMATE_EDGE) * inward);
+      }
+    }
+  };
 
   const pass = (): void => {
+    ownClimate();
     for (let i = 0; i < nLand; i++) {
       const c = cells[i];
       const s = Math.fround(bed[c] + (1 - ICE_ISOSTASY) * thick[c]);
-      changed[c] = first || s !== surf[c] ? 1 : 0;
+      const season = Math.fround(1 - (1 - iceSeason[c]) * own[c]);
+      changed[c] = first || s !== surf[c] || season !== seasonUsed[c] ? 1 : 0;
       if (!changed[c]) continue;
       surf[c] = s;
-      smb[c] = massBalance(cl, c, s);
+      seasonUsed[c] = season;
+      let edge = false;
+      if (thick[c] > 0 && iced(c)) for (let k = nbrStart[c], e = nbrStart[c + 1]; k < e && !edge; k++) edge = land[nbr[k]] === 1 && !iced(nbr[k]);
+      if (edge) {
+        // A margin cell spans the ice profile from its edge inward (about
+        // 0.58, 1 and 1.29 times its mean depth a sixth, half and five sixths
+        // of the way in). Melt grows faster than the warmth, so its mean
+        // surface alone would understate the melting edge, the more the
+        // coarser the mesh.
+        const h = (1 - ICE_ISOSTASY) * thick[c];
+        smb[c] =
+          (massBalance(cl, c, bed[c] + 0.577 * h, season, mean[c]) +
+            massBalance(cl, c, s, season, mean[c]) +
+            massBalance(cl, c, bed[c] + 1.29 * h, season, mean[c])) /
+          3;
+      } else smb[c] = massBalance(cl, c, s, season, mean[c]);
     }
     for (let i = 0; i < nLand; i++) {
       const c = cells[i];
@@ -239,10 +397,13 @@ export function simulateIce(
     }
   };
 
-  for (let it = 0; it < 5; it++) {
+  if (initial) for (const c of cells) thick[c] = initial[c];
+  // Inherited ice needs more passes: its margins melt back a little each pass.
+  const passes = initial ? INHERITED_PASSES : 5;
+  for (let it = 0; it < passes; it++) {
     pass();
     const next = plasticThickness(mesh, bed, cover, radiusM);
-    for (const c of cells) thick[c] = it === 0 ? next[c] : 0.5 * (thick[c] + next[c]);
+    for (const c of cells) thick[c] = it === 0 && !initial ? next[c] : 0.5 * (thick[c] + next[c]);
   }
   pass();
   const last = plasticThickness(mesh, bed, cover, radiusM);

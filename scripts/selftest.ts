@@ -10,7 +10,7 @@ import { deserializeWorld, serializeWorld } from '../src/io/save';
 import { buildFields, meshData, NET_INFO } from '../src/render/context';
 import { type LayerId, LAYERS, levelHeight, levelWidth, MAX_LEVEL, renderWindow, riverCourse, TILE } from '../src/render/raster';
 import { DEG, latLonToVec } from '../src/core/math';
-import { KOPPEN_CODES } from '../src/world/biomes';
+import { Biome, KOPPEN_CODES } from '../src/world/biomes';
 import { Channel, CHANNEL_NAMES } from '../src/world/channels';
 import { nearestCell } from '../src/core/mesh';
 import * as edits from '../src/world/edits';
@@ -78,7 +78,8 @@ check(world.geo.plates.length > 3, `generated ${world.geo.plates.length} plates,
     let peak = 0;
     for (let m = 0; m < 12; m++) peak = Math.max(peak, hydro.dischargeMonthly[c * 12 + m]);
     if (hydro.bankfull[c] < peak - 1e-3) smallBank++;
-    if (hydro.lake[c] >= 0 || hydro.discharge[c] < 50 || rc < 0 || ocean[rc] || hydro.lake[rc] >= 0 || hydro.endorheic[rc]) continue;
+    // (A river running onto an ice sheet goes on as meltwater over and under it.)
+    if (hydro.lake[c] >= 0 || hydro.discharge[c] < 50 || rc < 0 || ocean[rc] || hydro.lake[rc] >= 0 || hydro.endorheic[rc] || water.glacier[rc]) continue;
     if (hydro.discharge[rc] < 0.5 * hydro.discharge[c]) vanish++;
   }
   check(vanish === 0 && loops === 0 && smallBank === 0, `rivers run on unbroken (${vanish} lose half their water in a step), routing is a tree (${loops} loops), bankfull ≥ peak month everywhere (${smallBank} not)`);
@@ -120,6 +121,57 @@ check(world.geo.plates.length > 3, `generated ${world.geo.plates.length} plates,
     if (ice.cover[c] < 1) snouts++;
   }
   check(bad === 0, `ice mass balance closes on every glacier cell (${snouts} glacier tongues end inside their cell)`);
+}
+
+// Polar lands: under a low sun snow lingers and summers stay cool, and a large
+// polar landmass keeps the ice sheet the ice age built (its own height and
+// brightness feed it, as Greenland's and Antarctica's), with tundra, not
+// forest or steppe, on the ground it leaves bare.
+{
+  let bareArea = 0;
+  let bareHot = 0;
+  let bareMax = -Infinity;
+  let borealCold = 0;
+  let borealPolar = 0;
+  let worstIce = 1;
+  const shares: string[] = [];
+  for (const seed of ['kelp-umber-694', 'aurelia', 'vale-fen-46']) {
+    const w = sharedWorld(seed, seed === 'kelp-umber-694' ? 80000 : 40000);
+    const { fine, ocean, ice, temp, biomes } = w;
+    let hiArea = 0;
+    let hiIce = 0;
+    for (let c = 0; c < fine.n; c++) {
+      if (ocean[c]) continue;
+      const lat = Math.abs(fine.lat[c]) / DEG;
+      let hot = -Infinity;
+      for (let m = 0; m < 12; m++) hot = Math.max(hot, temp[c * 12 + m]);
+      if (biomes.biome[c] === Biome.Boreal) {
+        if (hot < 10) borealCold++;
+        if (lat >= 75) borealPolar++;
+      }
+      if (lat >= 70) {
+        hiArea += fine.area[c];
+        hiIce += fine.area[c] * ice.cover[c];
+      }
+      if (lat >= 75) {
+        // The bare ground's own summer, at sea level (under ice too, before the sheet chills it).
+        const hotSL = hot + (6.5 * Math.max(0, w.elev[c])) / 1000;
+        bareArea += fine.area[c];
+        bareHot += fine.area[c] * hotSL;
+        bareMax = Math.max(bareMax, hotSL);
+      }
+    }
+    const km2 = hiArea * w.params.radiusKm ** 2;
+    if (km2 > 2e6) worstIce = Math.min(worstIce, hiIce / hiArea);
+    shares.push(`${seed} ${(km2 / 1e6).toFixed(1)}M km² ${((100 * hiIce) / hiArea).toFixed(0)}%`);
+  }
+  const meanHot = bareHot / bareArea;
+  check(
+    bareArea > 0 && meanHot <= 8 && bareMax <= 12,
+    `land beyond 75° peaks at ${meanHot.toFixed(1)} °C at sea level in its warmest month (warmest ${bareMax.toFixed(1)} °C)`,
+  );
+  check(worstIce >= 0.6, `large polar landmasses carry ice sheets (land beyond 70° under ice: ${shares.join(', ')})`);
+  check(borealCold === 0 && borealPolar === 0, `no boreal forest where the warmest month stays below 10 °C or beyond 75° (${borealCold}, ${borealPolar} cells)`);
 }
 
 // Atolls crown drowned volcanoes in open water, clear of land and of each other
@@ -939,7 +991,7 @@ check(Math.max(...seams) <= 1, `tiles are seamless (max channel difference ${sea
     for (let ch = 0; ch < f.rivStart.length - 1; ch++) {
       for (let k = f.rivStart[ch] + 3; k < f.rivStart[ch + 1] - 3; k += 9) {
         const c = f.rivCell[k];
-        if (f.rivQ[k] >= 80 && !w.ocean[c] && w.hydro.lake[c] < 0 && f.amp[c] > 120 && f.rivNet[k] < 0) picks.push(k);
+        if (f.rivQ[k] >= 80 && !w.ocean[c] && w.hydro.lake[c] < 0 && f.amp[c] > 120 && f.rivNet[k] < 0 && w.ice.cover[c] < 0.05) picks.push(k);
       }
     }
     picks.sort((a, b) => f.amp[f.rivCell[b]] - f.amp[f.rivCell[a]]);
@@ -955,7 +1007,8 @@ check(Math.max(...seams) <= 1, `tiles are seamless (max channel difference ${sea
       for (let ch = 0; ch < f.rivStart.length - 1; ch++) {
         for (let j = f.rivStart[ch] + 1; j < f.rivStart[ch + 1] - 1; j++) {
           const c = f.rivCell[j];
-          if (f.rivQ[j] < 40 || w.ocean[c] || w.hydro.lake[c] >= 0 || f.rivNet[j] >= 0) continue;
+          // (Not under or beside ice: its rivers run hidden over or beneath it.)
+          if (f.rivQ[j] < 40 || w.ocean[c] || w.hydro.lake[c] >= 0 || f.rivNet[j] >= 0 || w.ice.cover[c] > 0.05) continue;
           let lon = w.fine.lon[c];
           lon += 2 * Math.PI * Math.round((w.fine.lon[c0] - lon) / (2 * Math.PI));
           const px = Math.round(((lon + Math.PI) / (2 * Math.PI)) * levelWidth(Lr)) - x0;
@@ -1101,6 +1154,150 @@ check(Math.max(...seams) <= 1, `tiles are seamless (max channel difference ${sea
     check(
       edges > 0 && crossing <= 0.01 * edges && turns > 0 && sharp <= 0.03 * turns,
       `deltas keep to their own rivers' ground (${crossing} of ${edges} distributaries cross another river) and rivers run on into their main channels (${sharp} of ${turns} turn back more than 100° at the apex)`,
+    );
+  }
+
+  // Deltas silt up the shallow bays and gaps beside them, drawn as land; a
+  // bird's foot's passes run out between strips of levee land; no braided
+  // reach in a narrow, rugged valley; drawn rivers fall steadily; tributaries
+  // meeting a trunk at one node join it at different points.
+  {
+    const ch = w.channels;
+    const fine = w.fine;
+    const fills: number[] = [];
+    let bridges = 0;
+    for (let c = 0; c < fine.n; c++) {
+      if (!ch.fill[c]) continue;
+      // (Its edge cells form the new coastline itself: only those with land or fill all round must draw as land.)
+      let inner = true;
+      for (let k = fine.nbrStart[c]; k < fine.nbrStart[c + 1]; k++) if (w.ocean[fine.nbr[k]] && !ch.fill[fine.nbr[k]]) inner = false;
+      if (inner) fills.push(c);
+      const seenNet = new Set<number>();
+      for (let k = fine.nbrStart[c]; k < fine.nbrStart[c + 1]; k++) {
+        const o = ch.networkOf[fine.nbr[k]];
+        if (o >= 0 && !w.ocean[fine.nbr[k]]) seenNet.add(o);
+      }
+      if (seenNet.size >= 2) bridges++;
+    }
+    /** Rendered elevation (m) at unit vector p, level L (a small window around it). */
+    const elevAt = (px: number, py: number, pz: number, L: number): number => {
+      const lat = Math.asin(pz);
+      const lon = Math.atan2(py, px);
+      const x = Math.floor(((lon + Math.PI) / (2 * Math.PI)) * levelWidth(L));
+      const y = Math.floor(((Math.PI / 2 - lat) / Math.PI) * levelHeight(L));
+      return renderWindow(rc, { layer: 'elevation', month: -1, rivers: false }, { level: L, x0: x - 4, y0: Math.max(0, y - 4), w: 9, h: 9 }, true).elevation![4 * 9 + 4];
+    };
+    let filledDry = 0;
+    const sample = fills.filter((_, i) => i % Math.max(1, Math.floor(fills.length / 30)) === 0).slice(0, 30);
+    for (const c of sample) if (elevAt(fine.x[c], fine.y[c], fine.z[c], 8) > 0.2) filledDry++;
+    // Bird's-foot passes: land a little either side of the last stretch of each, out past the old coast.
+    let flankN = 0;
+    let flankLand = 0;
+    for (let n = 0; n < f.netStart.length - 1 && flankN < 40; n++) {
+      const io = NET_INFO * n;
+      if (f.netInfo[io] !== 0 || f.netInfo[io + 1] !== 0) continue;
+      for (let g = f.netStart[n] + 1; g < f.netStart[n + 1] && flankN < 40; g++) {
+        if (f.netMouth[g] !== 1 || f.netQ[g] < 600) continue;
+        const p = f.netParent[g];
+        const mx = 0.5 * (f.netX[g] + f.netX[p]);
+        const my = 0.5 * (f.netY[g] + f.netY[p]);
+        const mz = 0.5 * (f.netZ[g] + f.netZ[p]);
+        const ml = Math.hypot(mx, my, mz);
+        const cm = nearestCell(fine, mx / ml, my / ml, mz / ml, f.netCell[n]);
+        if (!w.ocean[cm] || ch.fill[cm]) continue;
+        // Across the pass: perpendicular to it, a channel width and a half out.
+        const dx = f.netX[g] - f.netX[p];
+        const dy = f.netY[g] - f.netY[p];
+        const dz = f.netZ[g] - f.netZ[p];
+        let nx = (my / ml) * dz - (mz / ml) * dy;
+        let ny = (mz / ml) * dx - (mx / ml) * dz;
+        let nz = (mx / ml) * dy - (my / ml) * dx;
+        const nl = Math.hypot(nx, ny, nz) || 1;
+        const off = (1.5 * f.netW[g] + 300) / (w.params.radiusKm * 1000);
+        nx = (nx / nl) * off;
+        ny = (ny / nl) * off;
+        nz = (nz / nl) * off;
+        for (const sgn of [1, -1]) {
+          const qx = mx / ml + sgn * nx;
+          const qy = my / ml + sgn * ny;
+          const qz = mz / ml + sgn * nz;
+          const ql = Math.hypot(qx, qy, qz);
+          flankN++;
+          if (elevAt(qx / ql, qy / ql, qz / ql, 9) > 0.2) flankLand++;
+        }
+      }
+    }
+    // Braided or wandering in rugged ground with no floor to braid on.
+    let cramped = 0;
+    let multi = 0;
+    for (let c = 0; c < fine.n; c++) {
+      const p = ch.pattern[c];
+      if (p !== Channel.Braided && p !== Channel.Wandering) continue;
+      multi++;
+      const kd = w.deposits.kind[c];
+      const wide = w.iceAge.erosion[c] > 30 || kd === Deposit.Outwash || kd === Deposit.Alluvium || kd === Deposit.Fan || kd === Deposit.Lake || kd === Deposit.Delta;
+      if (!wide && w.relief.rough[c] > 300) cramped++;
+    }
+    // Drawn rivers fall from node to node (glacial troughs aside: their floors step over rock bars).
+    let steps = 0;
+    let rises = 0;
+    let worstRise = 0;
+    const Lr = 9;
+    const S = 768;
+    const big = [...Array(f.rivStart.length - 1).keys()].filter((c2) => f.rivQ[f.rivStart[c2 + 1] - 2] >= 300);
+    for (let t = 0; t < 12 && t < big.length; t++) {
+      const chn = big[Math.floor((t * big.length) / 12)];
+      const k0 = f.rivStart[chn] + Math.floor((f.rivStart[chn + 1] - f.rivStart[chn]) / 2);
+      const c0 = f.rivCell[k0];
+      const x0 = Math.round(((fine.lon[c0] + Math.PI) / (2 * Math.PI)) * levelWidth(Lr)) - S / 2;
+      const y0 = Math.max(0, Math.round(((Math.PI / 2 - fine.lat[c0]) / Math.PI) * levelHeight(Lr)) - S / 2);
+      const E = renderWindow(rc, { layer: 'elevation', month: -1, rivers: true }, { level: Lr, x0, y0, w: S, h: S }, true).elevation!;
+      const at = (c: number): number => {
+        let lon = fine.lon[c];
+        lon += 2 * Math.PI * Math.round((fine.lon[c0] - lon) / (2 * Math.PI));
+        const px = Math.round(((lon + Math.PI) / (2 * Math.PI)) * levelWidth(Lr)) - x0;
+        const py = Math.round(((Math.PI / 2 - fine.lat[c]) / Math.PI) * levelHeight(Lr)) - y0;
+        if (px < 2 || py < 2 || px >= S - 2 || py >= S - 2) return NaN;
+        let m = Infinity;
+        for (let oy = -1; oy <= 1; oy++) for (let ox = -1; ox <= 1; ox++) m = Math.min(m, E[(py + oy) * S + px + ox]);
+        return m;
+      };
+      for (let c2 = 0; c2 < f.rivStart.length - 1; c2++) {
+        for (let k = f.rivStart[c2]; k < f.rivStart[c2 + 1] - 2; k++) {
+          const a = f.rivCell[k];
+          const b = f.rivCell[k + 1];
+          if (f.rivQ[k + 1] < 100 || f.ocean[a] || f.ocean[b] || f.lake[a] >= 0 || f.lake[b] >= 0 || f.rivGlac[k] + f.rivGlac[k + 1] > 0 || f.rivNet[k] >= 0 || w.ice.cover[b] > 0.05) continue;
+          const za = at(a);
+          const zb = at(b);
+          if (!Number.isFinite(za) || !Number.isFinite(zb)) continue;
+          steps++;
+          if (zb > za + 10) {
+            rises++;
+            worstRise = Math.max(worstRise, zb - za);
+          }
+        }
+      }
+    }
+    // Junctions: where several tributaries reach a trunk node, each joins at its own point.
+    const byNode = new Map<number, number[]>();
+    for (let c2 = 0; c2 < f.rivStart.length - 1; c2++) {
+      const j = f.rivJoin[c2];
+      if (j < 0) continue;
+      const l = byNode.get(j);
+      if (l) l.push(c2);
+      else byNode.set(j, [c2]);
+    }
+    let multiJ = 0;
+    let shared = 0;
+    for (const chs of byNode.values()) {
+      if (chs.length < 2) continue;
+      multiJ++;
+      const offs = new Set(chs.map((c2) => f.rivStag[c2].toFixed(3)));
+      if (offs.size < chs.length) shared++;
+    }
+    check(
+      fills.length > 0 && filledDry >= 0.9 * sample.length && flankN >= 6 && flankLand >= 0.75 * flankN && cramped === 0 && steps >= 15 && rises <= 0.1 * steps && multiJ > 0 && shared <= 0.05 * multiJ,
+      `deltas silt up ${fills.length} inner cells of bay and shallows (${bridges} between two deltas; ${filledDry} of ${sample.length} drawn as land); bird's-foot passes flanked by levee land ${flankLand} of ${flankN} times; ${cramped} of ${multi} braided or wandering cells in narrow rugged valleys; drawn rivers rise more than 10 m on ${rises} of ${steps} steps (worst ${worstRise.toFixed(0)} m); ${multiJ - shared} of ${multiJ} shared junctions staggered`,
     );
   }
 }
@@ -1259,7 +1456,21 @@ check(Math.max(...seams) <= 1, `tiles are seamless (max channel difference ${sea
     for (let k = fine.nbrStart[c]; k < fine.nbrStart[c + 1]; k++) if (!w.ocean[fine.nbr[k]]) landNb = fine.nbr[k];
     if (landNb < 0) continue;
     if (f.strand[c] > 0.8 && (flatSea < 0 || f.strand[c] > f.strand[flatSea])) flatSea = c;
-    if (f.strand[c] === 0 && f.fjord[landNb] === 0 && w.deposits.kind[landNb] === Deposit.Delta && plainSea < 0) plainSea = c;
+  }
+  // A real delta's coast: the sea just off the mouth of the largest sea delta's main channel.
+  {
+    let best = -1;
+    for (let n = 0; n < f.netStart.length - 1; n++) {
+      if (f.netInfo[NET_INFO * n] !== 0) continue;
+      if (best < 0 || f.netInfo[NET_INFO * n + 5] > f.netInfo[NET_INFO * best + 5]) best = n;
+    }
+    if (best >= 0) {
+      let g = f.netStart[best];
+      for (let guard = 0; f.netNext[g] >= 0 && guard < 10000; guard++) g = f.netNext[g];
+      let c = nearestCell(fine, f.netX[g], f.netY[g], f.netZ[g], f.netCell[best]);
+      for (let k = fine.nbrStart[c]; k < fine.nbrStart[c + 1] && !w.ocean[c]; k++) if (w.ocean[fine.nbr[k]]) c = fine.nbr[k];
+      if (w.ocean[c] && f.strand[c] === 0) plainSea = c;
+    }
   }
   const isl = flatSea >= 0 ? islets(flatSea, 9) : 0;
   const islPlain = plainSea >= 0 ? islets(plainSea, 9) : 0;
