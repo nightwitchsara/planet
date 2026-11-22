@@ -21,6 +21,7 @@ export type LayerId =
   | 'fertility'
   | 'temperature'
   | 'precipitation'
+  | 'currents'
   | 'biomes'
   | 'koppen'
   | 'drainage'
@@ -37,6 +38,7 @@ export const LAYERS: { id: LayerId; label: string; monthly: boolean }[] = [
   { id: 'fertility', label: 'Soil fertility', monthly: false },
   { id: 'temperature', label: 'Temperature', monthly: true },
   { id: 'precipitation', label: 'Precipitation', monthly: true },
+  { id: 'currents', label: 'Ocean currents', monthly: false },
   { id: 'biomes', label: 'Biomes', monthly: false },
   { id: 'koppen', label: 'Köppen climate', monthly: false },
   { id: 'drainage', label: 'Rivers & drainage basins', monthly: false },
@@ -99,15 +101,16 @@ const L_DEPOSITS = 10;
 const L_SOILS = 11;
 const L_FERT = 12;
 const L_CHANNELS = 13;
+const L_CURRENTS = 14;
 const LAYER_CODE: Record<LayerId, number> = {
   terrain: L_TERRAIN, elevation: L_ELEV, plates: L_PLATES, crust: L_CRUST, temperature: L_TEMP,
   precipitation: L_PRECIP, biomes: L_BIOMES, koppen: L_KOPPEN, drainage: L_DRAIN, rocks: L_ROCK, deposits: L_DEPOSITS,
-  soils: L_SOILS, fertility: L_FERT, channels: L_CHANNELS,
+  soils: L_SOILS, fertility: L_FERT, channels: L_CHANNELS, currents: L_CURRENTS,
 };
 /** How strongly hillshading shows on each layer. */
-const SHADE_K = [1, 1, 0.4, 0.5, 0.35, 0.35, 0.6, 0.4, 0.5, 0.55, 0.6, 0.6, 0.5, 0.55];
+const SHADE_K = [1, 1, 0.4, 0.5, 0.35, 0.35, 0.6, 0.4, 0.5, 0.55, 0.6, 0.6, 0.5, 0.55, 0.6];
 const CATEGORICAL = new Set([L_PLATES, L_CRUST, L_BIOMES, L_KOPPEN, L_DRAIN, L_ROCK, L_DEPOSITS, L_SOILS]);
-const OUTLINED = new Set([L_TEMP, L_PRECIP, L_KOPPEN, L_CRUST, L_PLATES, L_ROCK, L_DEPOSITS, L_SOILS, L_FERT, L_CHANNELS]);
+const OUTLINED = new Set([L_TEMP, L_PRECIP, L_KOPPEN, L_CRUST, L_PLATES, L_ROCK, L_DEPOSITS, L_SOILS, L_FERT, L_CHANNELS, L_CURRENTS]);
 const RIVER_LAYERS = new Set([L_TERRAIN, L_ELEV, L_BIOMES, L_DRAIN, L_ROCK, L_DEPOSITS, L_SOILS, L_FERT, L_CHANNELS]);
 
 // ------------------------------------------------------------------ per-layer cell fields
@@ -169,6 +172,9 @@ function layerCells(f: FieldData, opt: RenderOptions): LayerCells {
     case 'crust':
       lc = { key, a: f.thick, modeA: MODE_ALL, b: f.age, modeB: MODE_ALL };
       break;
+    case 'currents':
+      lc = { key, a: null, modeA: MODE_ALL, b: f.curAnom, modeB: MODE_SEA };
+      break;
     case 'fertility':
       lc = { key, a: f.fertility, modeA: MODE_LAND, b: null, modeB: MODE_ALL };
       break;
@@ -180,9 +186,142 @@ function layerCells(f: FieldData, opt: RenderOptions): LayerCells {
 // ------------------------------------------------------------------ helpers
 
 let noiseCache: { seed: number; noise: Simplex3 } | null = null;
+/**
+ * Per cell: which of the fields that are zero or absent for most cells it
+ * has (bits CF_*), so the pixel loop's gather reads them only there. Made
+ * once per set of fields (they never change in place).
+ */
+const CF_GLACIAL = 1;
+const CF_ICE = 2;
+const CF_SHELF = 4;
+const CF_REEF = 8;
+const CF_NET = 16;
+const CF_LAKE = 32;
+const CELL_FLAGS = new WeakMap<FieldData, Uint8Array>();
+function cellFlags(f: FieldData): Uint8Array {
+  let fl = CELL_FLAGS.get(f);
+  if (fl) return fl;
+  const { scour, fjord, strand, ice, iceCover, iceMelt, shelf, reef, cellNet, lake } = f;
+  const n = f.elev.length;
+  fl = new Uint8Array(n);
+  for (let c = 0; c < n; c++) {
+    let b = 0;
+    if (scour[c] !== 0 || fjord[c] !== 0 || strand[c] !== 0) b |= CF_GLACIAL;
+    if (ice[c] !== 0 || iceCover[c] !== 0 || iceMelt[c] !== 0) b |= CF_ICE;
+    if (shelf[c] !== 0) b |= CF_SHELF;
+    if (reef[c] !== 0) b |= CF_REEF;
+    if (cellNet[c] >= 0) b |= CF_NET;
+    if (lake[c] >= 0) b |= CF_LAKE;
+    fl[c] = b;
+  }
+  CELL_FLAGS.set(f, fl);
+  return fl;
+}
+
 function noiseFor(seed: number): Simplex3 {
-  if (noiseCache?.seed !== seed) noiseCache = { seed, noise: new Simplex3(seed) };
+  if (noiseCache?.seed !== seed) {
+    noiseCache = { seed, noise: new Simplex3(seed) };
+    const tables = noiseCache.noise as unknown as { perm: Uint8Array; permMod12: Uint8Array };
+    SN_PERM = tables.perm;
+    for (let i = 0; i < 512; i++) SN_PM3[i] = 3 * tables.permMod12[i];
+  }
   return noiseCache.noise;
+}
+
+/**
+ * Self-test: the renderer's own noise (snoise) against Simplex3 at n random
+ * points of the kind it is called at, and the largest |value| seen, which the
+ * renderer's early-outs assume stays under NOISE_MAX.
+ */
+export function rendererNoiseCheck(seed: number, n: number): { mismatches: number; maxAbs: number; bound: number } {
+  const ref = noiseFor(seed);
+  let mismatches = 0;
+  let maxAbs = 0;
+  let s = (12345 ^ seed) >>> 0;
+  const rnd = (): number => (s = (Math.imul(s, 1103515245) + 12345) >>> 0) / 4294967296;
+  for (let i = 0; i < n; i++) {
+    const f = 10 ** (5.5 * rnd());
+    const x = (2 * rnd() - 1) * f + 80 * (rnd() - 0.5);
+    const y = (2 * rnd() - 1) * f + 80 * (rnd() - 0.5);
+    const z = (2 * rnd() - 1) * f + 80 * (rnd() - 0.5);
+    const a = ref.noise(x, y, z);
+    if (snoise(x, y, z) !== a) mismatches++;
+    maxAbs = Math.max(maxAbs, Math.abs(a));
+  }
+  return { mismatches, maxAbs, bound: NOISE_MAX };
+}
+
+/** The permutation of the noise noiseFor last made (snoise), and its gradient indices times 3. */
+let SN_PERM: Uint8Array = new Uint8Array(512);
+const SN_PM3 = new Uint8Array(512);
+const SN_GRAD = new Float64Array([1, 1, 0, -1, 1, 0, 1, -1, 0, -1, -1, 0, 1, 0, 1, -1, 0, 1, 1, 0, -1, -1, 0, -1, 0, 1, 1, 0, -1, 1, 0, 1, -1, 0, -1, -1]);
+const SN_F3 = 1 / 3;
+const SN_G3 = 1 / 6;
+
+/**
+ * Simplex3.noise of the noise noiseFor last made, the same values bit for
+ * bit: a plain function over module tables that picks the simplex's corner
+ * order without branches. The sub-cell relief calls it for every octave of
+ * every pixel; this is several percent faster than the method.
+ */
+function snoise(xin: number, yin: number, zin: number): number {
+  const perm = SN_PERM;
+  const pm = SN_PM3;
+  const s = (xin + yin + zin) * SN_F3;
+  const i = Math.floor(xin + s);
+  const j = Math.floor(yin + s);
+  const k = Math.floor(zin + s);
+  const t = (i + j + k) * SN_G3;
+  const x0 = xin - (i - t);
+  const y0 = yin - (j - t);
+  const z0 = zin - (k - t);
+  const xy = x0 >= y0 ? 1 : 0;
+  const xz = x0 >= z0 ? 1 : 0;
+  const yz = y0 >= z0 ? 1 : 0;
+  const i1 = xy & xz;
+  const j1 = (1 - xy) & yz;
+  const k1 = (1 - xz) & (1 - yz);
+  const i2 = xy | xz;
+  const j2 = (1 - xy) | yz;
+  const k2 = (1 - xz) | (1 - yz);
+  const x1 = x0 - i1 + SN_G3;
+  const y1 = y0 - j1 + SN_G3;
+  const z1 = z0 - k1 + SN_G3;
+  const x2 = x0 - i2 + 2 * SN_G3;
+  const y2 = y0 - j2 + 2 * SN_G3;
+  const z2 = z0 - k2 + 2 * SN_G3;
+  const x3 = x0 - 1 + 3 * SN_G3;
+  const y3 = y0 - 1 + 3 * SN_G3;
+  const z3 = z0 - 1 + 3 * SN_G3;
+  const ii = i & 255;
+  const jj = j & 255;
+  const kk = k & 255;
+  let n = 0;
+  let t0 = 0.6 - x0 * x0 - y0 * y0 - z0 * z0;
+  if (t0 > 0) {
+    const g = pm[ii + perm[jj + perm[kk]]];
+    t0 *= t0;
+    n += t0 * t0 * (SN_GRAD[g] * x0 + SN_GRAD[g + 1] * y0 + SN_GRAD[g + 2] * z0);
+  }
+  let t1 = 0.6 - x1 * x1 - y1 * y1 - z1 * z1;
+  if (t1 > 0) {
+    const g = pm[ii + i1 + perm[jj + j1 + perm[kk + k1]]];
+    t1 *= t1;
+    n += t1 * t1 * (SN_GRAD[g] * x1 + SN_GRAD[g + 1] * y1 + SN_GRAD[g + 2] * z1);
+  }
+  let t2 = 0.6 - x2 * x2 - y2 * y2 - z2 * z2;
+  if (t2 > 0) {
+    const g = pm[ii + i2 + perm[jj + j2 + perm[kk + k2]]];
+    t2 *= t2;
+    n += t2 * t2 * (SN_GRAD[g] * x2 + SN_GRAD[g + 1] * y2 + SN_GRAD[g + 2] * z2);
+  }
+  let t3 = 0.6 - x3 * x3 - y3 * y3 - z3 * z3;
+  if (t3 > 0) {
+    const g = pm[ii + 1 + perm[jj + 1 + perm[kk + 1]]];
+    t3 *= t3;
+    n += t3 * t3 * (SN_GRAD[g] * x3 + SN_GRAD[g + 1] * y3 + SN_GRAD[g + 2] * z3);
+  }
+  return 32 * n;
 }
 
 const smooth01 = (x: number): number => (x <= 0 ? 0 : x >= 1 ? 1 : x * x * (3 - 2 * x));
@@ -413,6 +552,12 @@ function valleyHalfWidth(q: number, mPerPx: number): number {
 /** Valleys keep their width on the ground as you zoom in, up to this many pixels. */
 const VALLEY_MAX_PX = 400;
 
+/**
+ * A bound on |Simplex3.noise| (its largest value found by search is about
+ * 0.979), for skipping noise sums that cannot change a result.
+ */
+const NOISE_MAX = 1.1;
+
 /** Noise octaves of sub-cell detail when cells are `hPx` pixels apart. */
 const octavesFor = (hPx: number): number => Math.max(1, Math.min(12, Math.floor(Math.log2(Math.max(1, hPx / 2))) + 1));
 
@@ -429,7 +574,7 @@ function roughChi(noise: Simplex3, chi: number, M: number, fj: number, px: numbe
   let a = 1;
   let fr = f0 * 1.1;
   for (let k = 0; k < K; k++) {
-    s += a * noise.noise(px * fr + 101.3 - 31.1 * k, py * fr + 7.7 * k, pz * fr - 3.3 * k);
+    s += a * snoise(px * fr + 101.3 - 31.1 * k, py * fr + 7.7 * k, pz * fr - 3.3 * k);
     a *= 0.55;
     fr *= 2;
   }
@@ -447,23 +592,31 @@ function subcellRelief(noise: Simplex3, px: number, py: number, pz: number, f0: 
   let s = 0;
   let a = 1;
   let fr = f0;
-  let wgt = 1;
-  // Main crests rise to summits and dip to cols along their length; at one
-  // height they would run on as unbroken walls (and as lines of rock through ice).
-  const crest = M > 0.02 ? 0.6 + 0.45 * noise.noise(px * f0 * 1.7 - 47.1, py * f0 * 1.7 + 13.9, pz * f0 * 1.7 + 88.3) : 1;
   let low = 0;
-  for (let k = 0; k < octaves; k++) {
-    let v = noise.noise(px * fr + 17.3 * k, py * fr - 9.1 * k, pz * fr + 5.7 * k);
-    if (M > 0.02) {
+  if (M > 0.02) {
+    // Main crests rise to summits and dip to cols along their length; at one
+    // height they would run on as unbroken walls (and as lines of rock through ice).
+    const crest = 0.6 + 0.45 * snoise(px * f0 * 1.7 - 47.1, py * f0 * 1.7 + 13.9, pz * f0 * 1.7 + 88.3);
+    let wgt = 1;
+    for (let k = 0; k < octaves; k++) {
+      let v = snoise(px * fr + 17.3 * k, py * fr - 9.1 * k, pz * fr + 5.7 * k);
       const r = 1 - Math.abs(v);
       const sig = r * r * wgt * (k === 0 ? crest : 1);
       wgt = Math.max(0.35, Math.min(1, sig * 2));
       v += (2.2 * (sig - 0.42) - v) * M;
+      s += a * v;
+      if (k < 2) low = s;
+      a *= gain;
+      fr *= 2;
     }
-    s += a * v;
-    if (k < 2) low = s;
-    a *= gain;
-    fr *= 2;
+  } else {
+    // (Plain fBm where there are no young mountains: the same sum without the ridging.)
+    for (let k = 0; k < octaves; k++) {
+      s += a * snoise(px * fr + 17.3 * k, py * fr - 9.1 * k, pz * fr + 5.7 * k);
+      if (k < 2) low = s;
+      a *= gain;
+      fr *= 2;
+    }
   }
   const norm = (0.5 * Math.sqrt(1 - gain * gain)) / 0.3;
   reliefLow = low * norm;
@@ -538,11 +691,11 @@ function landSurface(
     let a = 1;
     let fr = fFjord;
     for (let k = 0, nk = Math.max(4, Math.min(9, K - 3)); k < nk; k++) {
-      jag += a * noise.noise(px * fr - 33.7 + 5.1 * k, py * fr + 71.9, pz * fr - 11.3 * k);
+      jag += a * snoise(px * fr - 33.7 + 5.1 * k, py * fr + 71.9, pz * fr - 11.3 * k);
       a *= 0.55;
       fr *= 2.3;
     }
-    steps = 2 * noise.noise(px * fFjord * 0.45 + 12.9, py * fFjord * 0.45 - 40.2, pz * fFjord * 0.45 + 7.7);
+    steps = 2 * snoise(px * fFjord * 0.45 + 12.9, py * fFjord * 0.45 - 40.2, pz * fFjord * 0.45 + 7.7);
     // Distance from the river as a share of the valley's half-width (cv = (1 − d)^1.5),
     // pushed out into hollows and in along spurs of the ground around.
     const d = 1 - Math.cbrt(cv * cv);
@@ -566,23 +719,55 @@ function landSurface(
     // last. How much ground it takes follows the cells' ice cover, so a
     // margin runs raggedly between ice-covered and ice-free cells instead
     // of ringing each ice cell.
-    let mn = 0;
-    let a = 1;
-    let fr = fIce;
-    for (let k = 0, nk = Math.max(3, K - 1); k < nk; k++) {
-      mn += a * noise.noise(px * fr + 61.3 - 7.1 * k, py * fr - 21.7 + 3.3 * k, pz * fr + 9.4);
-      a *= 0.5;
-      fr *= 2;
-    }
-    const u = Dn + 0.55 * mn - 0.8 * cv - trough / 600;
+    // u = Dn + 0.55·mn − 0.8·cv − trough/600, with mn the margin's noise below.
     // u spreads about logistically (scale 0.42): this cutoff covers a `cov` share of the
     // ground, sharpened so the kernel's tails don't spill ice into ice-free cells.
     const cs = smooth01((cov - 0.08) / 0.84);
     const z = cs >= 0.995 ? Infinity : cs <= 0 ? -Infinity : 0.42 * Math.log(cs / (1 - cs));
-    if (u < z) {
+    // (mn's octaves are only summed where they can matter: |0.55·mn| stays
+    // under `lim`, so far enough below the cutoff the ice lies at full
+    // thickness and far enough above it there is none, whatever mn is.)
+    const base = Dn - 0.8 * cv - trough / 600;
+    const lim = 1.1 * NOISE_MAX + 1e-9;
+    let under = true;
+    let taper = 1;
+    if (z === -Infinity || base - lim >= z) under = false;
+    else if (z !== Infinity && base + lim + 0.35 > z) {
+      let mn = 0;
+      let a = 1;
+      let fr = fIce;
+      const nk = Math.max(3, K - 1);
+      const tail = 0.5 ** (nk - 1);
+      let decided = false;
+      for (let k = 0; k < nk; k++) {
+        if (k > 0) {
+          // (Octaves k…nk−1 still to come move u by at most `rest`: stop once
+          // that cannot change whether there is ice or its full thickness.)
+          const rest = 0.55 * NOISE_MAX * (2 * a - tail) + 1e-9;
+          const uk = base + 0.55 * mn;
+          if (uk - rest >= z) {
+            under = false;
+            decided = true;
+            break;
+          }
+          if (uk + rest + 0.35 <= z) {
+            decided = true;
+            break;
+          }
+        }
+        mn += a * snoise(px * fr + 61.3 - 7.1 * k, py * fr - 21.7 + 3.3 * k, pz * fr + 9.4);
+        a *= 0.5;
+        fr *= 2;
+      }
+      if (!decided) {
+        const u = Dn + 0.55 * mn - 0.8 * cv - trough / 600;
+        if (u < z) taper = Math.sqrt(Math.min(1, (z - u) / 0.35));
+        else under = false;
+      }
+    }
+    if (under) {
       // As thick as the cells' ice where it lies under a smooth surface,
       // thinning toward its edge, where it drapes the ground it ends on.
-      const taper = Math.sqrt(Math.min(1, (z - u) / 0.35));
       const Hp = iceFull * taper;
       const top = ground + (1 - ICE_ISOSTASY) * Hp + Math.max(0.04, 1 - taper) * A * Dn;
       // Peaks whose rock stands higher break through as nunataks.
@@ -637,7 +822,7 @@ function landSurface(
       if (mouth > 0) {
         if (e0 < -40) e0 += 0.8 * mouth * (-40 - e0);
         const fs = R / 2500;
-        const knob = noise.noise(px * fs + 5.3, py * fs - 77.1, pz * fs + 31.7) + 0.5 * noise.noise(px * fs * 2.7 - 13.9, py * fs * 2.7 + 4.4, pz * fs * 2.7 - 61.2);
+        const knob = snoise(px * fs + 5.3, py * fs - 77.1, pz * fs + 31.7) + 0.5 * snoise(px * fs * 2.7 - 13.9, py * fs * 2.7 + 4.4, pz * fs * 2.7 - 61.2);
         e0 += mouth * 90 * Math.max(0, knob - 0.25);
       }
     }
@@ -665,19 +850,30 @@ function landSurface(
 }
 
 /**
- * Ragged edges (lake shores, ice-shelf fronts): fractal noise from frequency
- * `f` down to a few pixels, one octave more per zoom level as for the coastline.
+ * Ragged edges (lake shores, delta fronts, ice-shelf fronts) cut by a fractal
+ * noise from frequency `f` down to a few pixels, one octave more per zoom level
+ * as for the coastline: s = n(f) + Σ_{k=1…K−3} 0.5^k n(2^k f).
+ * Is base + scale·s > thr (scale > 0)? The same answer as that expression,
+ * summing only the octaves that can still change it: the octaves left after
+ * octave k−1 add at most NOISE_MAX·(0.5^(k−1) − 0.5^last) either way.
  */
-function raggedEdge(noise: Simplex3, px: number, py: number, pz: number, f: number, K: number): number {
-  let s = noise.noise(px * f + 3.3, py * f - 71.1, pz * f + 29.9);
+function raggedAbove(px: number, py: number, pz: number, f: number, K: number, base: number, scale: number, thr: number): boolean {
+  let s = snoise(px * f + 3.3, py * f - 71.1, pz * f + 29.9);
+  const last = K - 3;
+  const tail = 0.5 ** last;
   let a = 0.5;
   let fr = f * 2;
-  for (let k = 1; k < K - 2; k++) {
-    s += a * noise.noise(px * fr + 3.3 + 17.1 * k, py * fr - 71.1, pz * fr + 29.9 - 9.7 * k);
+  for (let k = 1; k <= last; k++) {
+    // (Octaves k…last still to come, amplitudes 0.5^k…0.5^last.)
+    const rest = scale * NOISE_MAX * (2 * a - tail) + 1e-9;
+    const v = base + scale * s;
+    if (v - rest > thr) return true;
+    if (v + rest <= thr) return false;
+    s += a * snoise(px * fr + 3.3 + 17.1 * k, py * fr - 71.1, pz * fr + 29.9 - 9.7 * k);
     a *= 0.5;
     fr *= 2;
   }
-  return s;
+  return base + scale * s > thr;
 }
 
 /**
@@ -694,8 +890,8 @@ function lakeAt(noise: Simplex3, px: number, py: number, pz: number, f0: number,
   if (wet > 0.82) return true;
   if (wet < 0.18 && ground >= level) return false;
   // (The body's shore wanders on a broader scale than the coves of the hollows.)
-  if (wet > 0.18 && wet + 0.2 * raggedEdge(noise, px, py, pz, f0 * 1.5, K) > 0.5) return true;
-  return ground < level && share + 0.3 * raggedEdge(noise, px, py, pz, f0 * 2.5, K) > 0.22;
+  if (wet > 0.18 && raggedAbove(px, py, pz, f0 * 1.5, K, wet, 0.2, 0.5)) return true;
+  return ground < level && raggedAbove(px, py, pz, f0 * 2.5, K, share, 0.3, 0.22);
 }
 
 /** Last triangle found by dryAt or cellChiAt (walk start for the next, nearby point). */
@@ -2356,6 +2552,31 @@ const NP_J = new Int32Array(18);
 const NP_CI = new Float64Array([NaN, NaN]);
 const NP_CJ = new Float64Array(2);
 const NP_KEY = new Float64Array(2);
+/**
+ * For each level's lattice cell and run-break probability: per nearest point b
+ * and neighbor k (entry 9b + k), whether a channel separates them (0: none)
+ * and the channel's line, its unit normal and the midpoint it passes through.
+ * The same for every pixel of the cell, so worked out once per nearest point.
+ */
+const PC_TAG = new Float64Array([NaN, NaN, NaN, NaN, NaN, NaN, NaN, NaN]);
+const PC_DONE = new Uint8Array(18);
+const PC_CH = new Uint8Array(162);
+const PC_NX = new Float64Array(162);
+const PC_NY = new Float64Array(162);
+const PC_MX = new Float64Array(162);
+const PC_MY = new Float64Array(162);
+
+/** Readies level lv's pair table for its current lattice cell (tag: the cell, key and run-break probability). */
+function pairCell(lv: number, pB: number): void {
+  const o = 4 * lv;
+  if (PC_TAG[o] !== NP_CI[lv] || PC_TAG[o + 1] !== NP_CJ[lv] || PC_TAG[o + 2] !== NP_KEY[lv] || PC_TAG[o + 3] !== pB) {
+    PC_TAG[o] = NP_CI[lv];
+    PC_TAG[o + 1] = NP_CJ[lv];
+    PC_TAG[o + 2] = NP_KEY[lv];
+    PC_TAG[o + 3] = pB;
+    PC_DONE.fill(0, 9 * lv, 9 * lv + 9);
+  }
+}
 /** Results of braidNet: water coverage (0–1, before opacity), bare ground between the channels (0–1), and how much of the pixel is belt rather than floodplain beyond it (0–1). */
 let netWater = 0;
 let netBare = 1;
@@ -2472,29 +2693,56 @@ function braidNet(noise: Simplex3, tau: number, nPx: number, h: number, pa: numb
   let sum = 0;
   let dEdge = Infinity;
   let edgeOut = false;
+  // (Which neighbors a channel parts this point's cell from, and each
+  // channel's line: the same for the cell's every pixel, worked out once.)
+  pairCell(0, pB);
+  const bo = 9 * best;
+  if (PC_DONE[best] === 0) {
+    PC_DONE[best] = 1;
+    for (let k = 0; k < 9; k++) {
+      let ch = 0;
+      if (k !== best) {
+        const jk = NP_J[k];
+        const outK = jk < 0 || jk >= NET_ROWS;
+        // Cells of one run (or both beyond the belt) have no channel between them.
+        // Nor does a bar along the bank that lies against it (a whole run, so no
+        // channel is left hanging): the belt's margin wanders in and out instead
+        // of running as one unbroken channel down each bank.
+        const none = (outB || outK ? outB && outK : jk === bj && sameRun(bi, NP_I[k], bj, key, pB)) || (outB !== outK && bankAttached(outB ? NP_I[k] : bi, outB ? jk : bj, key, pB));
+        if (!none) {
+          ch = outB || outK ? 2 : 1;
+          const ex = NP_X[k] - NP_X[best];
+          const ey = NP_Y[k] - NP_Y[best];
+          const el = Math.sqrt(ex * ex + ey * ey);
+          PC_NX[bo + k] = ex / el;
+          PC_NY[bo + k] = ey / el;
+          PC_MX[bo + k] = (NP_X[k] + NP_X[best]) * 0.5;
+          PC_MY[bo + k] = (NP_Y[k] + NP_Y[best]) * 0.5;
+        }
+      }
+      PC_CH[bo + k] = ch;
+    }
+  }
+  /** The bank channels' extra distance (narrower than the rest), once per pixel. */
+  let edgeExtra = NaN;
   for (let k = 0; k < 9; k++) {
-    if (k === best) continue;
-    const jk = NP_J[k];
-    const outK = jk < 0 || jk >= NET_ROWS;
-    // Cells of one run (or both beyond the belt) have no channel between them.
-    if (outB || outK ? outB && outK : jk === bj && sameRun(bi, NP_I[k], bj, key, pB)) continue;
-    // Nor does a bar along the bank that lies against it (a whole run, so no
-    // channel is left hanging): the belt's margin wanders in and out instead
-    // of running as one unbroken channel down each bank.
-    if (outB !== outK && bankAttached(outB ? NP_I[k] : bi, outB ? jk : bj, key, pB)) continue;
-    const ex = NP_X[k] - NP_X[best];
-    const ey = NP_Y[k] - NP_Y[best];
-    const el = Math.sqrt(ex * ex + ey * ey);
-    const nx = ex / el;
-    const ny = ey / el;
+    const ch = PC_CH[bo + k];
+    if (ch === 0) continue;
+    const nx = PC_NX[bo + k];
+    const ny = PC_NY[bo + k];
     // Distance to the boundary (in lattice units, then pixels across it).
-    const delta = ((NP_X[k] + NP_X[best]) * 0.5 - X) * nx + ((NP_Y[k] + NP_Y[best]) * 0.5 - Y) * ny;
+    const delta = (PC_MX[bo + k] - X) * nx + (PC_MY[bo + k] - Y) * ny;
     // (The belt's outermost channels, along its banks, are narrower: counted
     // farther. Never vanishing, else they would show as loose threads.)
-    const dpx = delta / Math.sqrt((nx / sx) * (nx / sx) + (ny / sy) * (ny / sy)) + (outB || outK ? half * (0.15 + 0.35 * (0.5 + 0.5 * Math.sin(1.3 * X + 3 * wx))) : 0);
+    let extra = 0;
+    if (ch === 2) {
+      if (edgeExtra !== edgeExtra) edgeExtra = half * (0.15 + 0.35 * (0.5 + 0.5 * Math.sin(1.3 * X + 3 * wx)));
+      extra = edgeExtra;
+    }
+    const dpx = delta / Math.sqrt((nx / sx) * (nx / sx) + (ny / sy) * (ny / sy)) + extra;
     if (dpx < dEdge) {
       dEdge = dpx;
-      edgeOut = outB || outK;
+      edgeOut = ch === 2;
     }
     if (dpx < half + 5 * r) sum += Math.exp(-Math.max(0, dpx) / r);
   }
@@ -2528,15 +2776,30 @@ function braidNet(noise: Simplex3, tau: number, nPx: number, h: number, pa: numb
     const half2 = Math.max(0.5, Math.min(0.2 * sy2, Math.max(0.3, (0.95 * chan) / Math.sqrt(Math.max(1, nT)))) * (0.15 + 0.35 * s2 * s2));
     const r2 = 0.3 * half2 + 0.5;
     let sum2 = 0;
+    pairCell(1, pB2);
+    const bo2 = 81 + 9 * (b2 - 9) - 9;
+    if (PC_DONE[b2] === 0) {
+      PC_DONE[b2] = 1;
+      for (let k = 9; k < 18; k++) {
+        let ch = 0;
+        if (k !== b2 && !(NP_J[k] === j2 && sameRun(i2, NP_I[k], j2, key + 17, pB2))) {
+          ch = 1;
+          const ex = NP_X[k] - NP_X[b2];
+          const ey = NP_Y[k] - NP_Y[b2];
+          const el = Math.sqrt(ex * ex + ey * ey);
+          PC_NX[bo2 + k] = ex / el;
+          PC_NY[bo2 + k] = ey / el;
+          PC_MX[bo2 + k] = (NP_X[k] + NP_X[b2]) * 0.5;
+          PC_MY[bo2 + k] = (NP_Y[k] + NP_Y[b2]) * 0.5;
+        }
+        PC_CH[bo2 + k] = ch;
+      }
+    }
     for (let k = 9; k < 18; k++) {
-      if (k === b2) continue;
-      if (NP_J[k] === j2 && sameRun(i2, NP_I[k], j2, key + 17, pB2)) continue;
-      const ex = NP_X[k] - NP_X[b2];
-      const ey = NP_Y[k] - NP_Y[b2];
-      const el = Math.sqrt(ex * ex + ey * ey);
-      const nx = ex / el;
-      const ny = ey / el;
-      const delta = ((NP_X[k] + NP_X[b2]) * 0.5 - X2) * nx + ((NP_Y[k] + NP_Y[b2]) * 0.5 - Y2) * ny;
+      if (PC_CH[bo2 + k] === 0) continue;
+      const nx = PC_NX[bo2 + k];
+      const ny = PC_NY[bo2 + k];
+      const delta = (PC_MX[bo2 + k] - X2) * nx + (PC_MY[bo2 + k] - Y2) * ny;
       const d2 = delta / Math.sqrt((nx / sx2) * (nx / sx2) + (ny / sy2) * (ny / sy2));
       if (d2 < half2 + 5 * r2) sum2 += Math.exp(-Math.max(0, d2) / r2);
     }
@@ -2550,6 +2813,9 @@ function braidNet(noise: Simplex3, tau: number, nPx: number, h: number, pa: numb
   netBare = veg && !outB ? fringe : 1;
   netBelt = outB ? fringe : 1;
 }
+
+/** A quad's four corners (stampQuad), x then y. */
+const QC = new Float64Array(8);
 
 function stampQuad(noise: Simplex3, o0: number, o1: number, key: number, Wg: number, Hg: number): void {
   const a0x = BV[o0];
@@ -2573,8 +2839,40 @@ function stampQuad(noise: Simplex3, o0: number, o1: number, key: number, Wg: num
   const jRef = dAx * (m0y + 0.5 * dMy) - dAy * (m0x + 0.5 * dMx);
   // Pixels per unit τ along this quad.
   const pa = Math.hypot(dAx, dAy) / Math.max(1e-6, Math.abs(BV[o1 + 6] - BV[o0 + 6]));
+  // (Every point the map accepts, t in [−0.03, 1.03] and u in [−1, 1], lies in
+  // the convex hull of its four corners: each row visits only the pixels
+  // within that hull, a pixel and a half to spare, not the whole bounding box
+  // of a short, wide and slanted quad.)
+  for (let c = 0; c < 4; c++) {
+    const t = c < 2 ? -0.03 : 1.03;
+    const u = c === 0 || c === 3 ? -1 : 1;
+    QC[2 * c] = a0x + t * dAx + u * (m0x + t * dMx);
+    QC[2 * c + 1] = a0y + t * dAy + u * (m0y + t * dMy);
+  }
   for (let py = minY; py <= maxY; py++) {
-    for (let px = minX; px <= maxX; px++) {
+    let lo = Infinity;
+    let hi = -Infinity;
+    for (let c1 = 0; c1 < 4; c1++) {
+      const x1 = QC[2 * c1];
+      const y1 = QC[2 * c1 + 1];
+      for (let c2 = c1 + 1; c2 < 4; c2++) {
+        const x2 = QC[2 * c2];
+        const y2 = QC[2 * c2 + 1];
+        if ((y1 - py) * (y2 - py) > 0) continue;
+        if (y1 === y2) {
+          lo = Math.min(lo, x1, x2);
+          hi = Math.max(hi, x1, x2);
+        } else {
+          const x = x1 + ((py - y1) * (x2 - x1)) / (y2 - y1);
+          lo = Math.min(lo, x);
+          hi = Math.max(hi, x);
+        }
+      }
+    }
+    if (lo > hi) continue;
+    const rx0 = Math.max(minX, Math.floor(lo - 1.5));
+    const rx1 = Math.min(maxX, Math.ceil(hi + 1.5));
+    for (let px = rx0; px <= rx1; px++) {
       // Invert the quad's map P = A0 + t·dA + u·(M0 + t·dM) for (t, u).
       const Qx = px - a0x;
       const Qy = py - a0y;
@@ -2915,6 +3213,8 @@ function mergeStream(Wg: number): void {
 let tileNets = new Int32Array(16);
 let tileNetN = 0;
 let tileCos = new Float64Array(16);
+/** Per tile network: how far its shoreline may reach past its outline (netAt's slack; set by renderWindow). */
+let tileSlack = new Float64Array(16);
 /** Node positions of the network being drawn (px), and which nodes lie on its main channel. */
 let NODE_PX = new Float64Array(2048);
 let ON_MAIN = new Uint8Array(1024);
@@ -3003,12 +3303,13 @@ function rasterNetworks(md: MeshData, f: FieldData, L: number, x0g: number, y0g:
     /** A fan wash's least half-width (px): a share of the cone however little water it carries. */
     const washPx = fan ? (0.022 * netInfo[io + 5]) / dRad : 0;
     st.seed = 100 * hash01(s0, n, 947);
-    st.alpha = alpha * (months >= 4 ? 1 : 0.7);
+    // (A fan's washes run only in floods: thin threads over bare gravel, not sheets of water.)
+    st.alpha = alpha * (months >= 4 ? 1 : 0.7) * (fan ? 0.6 : 1);
     st.pat0 = st.pat1 = Channel.Distributary + 1;
     st.braid0 = st.braid1 = fan ? 1 : 0;
     st.anas0 = st.anas1 = 0;
     st.threads0 = st.threads1 = 3;
-    st.bars0 = st.bars1 = 0.25 + 0.75 * netInfo[io + 7];
+    st.bars0 = st.bars1 = fan ? 0.75 + 0.25 * netInfo[io + 7] : 0.25 + 0.75 * netInfo[io + 7];
     st.gravel0 = st.gravel1 = 1 - smooth01((netInfo[io + 4] - 0.3) / 0.5);
     st.meander0 = st.meander1 = 0;
     st.sinu0 = st.sinu1 = 1;
@@ -3039,9 +3340,9 @@ function rasterNetworks(md: MeshData, f: FieldData, L: number, x0g: number, y0g:
         // visible share of the cone however little water it carries.
         const qTop = Math.max(1e-6, netQ[s0]);
         st.belt0 = Math.max(2.6 * hA, washPx * (0.45 + 0.55 * Math.sqrt(netQ[pg] / qTop)));
-        st.belt1 = Math.max(2.6 * hB, washPx * (0.45 + 0.55 * Math.sqrt(netQ[g] / qTop)) * (netMouth[g] === 1 ? 0.5 : 1));
-        st.chan0 = 2 * hA;
-        st.chan1 = 2 * hB;
+        st.belt1 = Math.max(2.6 * hB, washPx * (0.45 + 0.55 * Math.sqrt(netQ[g] / qTop)) * (netMouth[g] === 1 ? 0.75 : 1));
+        st.chan0 = 1.2 * hA;
+        st.chan1 = 1.2 * hB;
         // (Along-channel lattice by the wash's own width, one for the whole fan,
         // so its bars and channels are sized to the drawn belt.)
         const bw = Math.max(2.6 * Math.max(1, netW[s0]), 0.03 * netInfo[io + 5] * R);
@@ -3295,17 +3596,15 @@ function netAt(f: FieldData, px: number, py: number, pz: number, slack0: number)
     const t1 = netTheta[2 * n + 1];
     const th = fastAtan2(v, u);
     if (th < t0 || th > t1) continue;
-    const a = ((th - t0) / (t1 - t0)) * (NET_BINS - 1);
+    const af = (th - t0) / (t1 - t0);
+    const a = af * (NET_BINS - 1);
     const b = Math.min(NET_BINS - 2, Math.floor(a));
     const Rf = netFront[NET_BINS * n + b] + (netFront[NET_BINS * n + b + 1] - netFront[NET_BINS * n + b]) * (a - b);
     const r = Math.hypot(u, v);
-    const io = NET_INFO * n;
-    const slack = f.netInfo[io] === 0 ? Math.max(slack0, 1.2 * deltaRag(f.netInfo[io + 5], f.netInfo[io + 2])) : slack0;
-    if (r >= Rf + slack) continue;
+    if (r >= Rf + tileSlack[k]) continue;
     netHit = n;
     netRho = r / Math.max(Rf, 1e-9);
     netGap = Rf - r;
-    const af = (th - t0) / (t1 - t0);
     netFirm = smooth01(af / 0.07) * smooth01((1 - af) / 0.07);
     return;
   }
@@ -3321,6 +3620,122 @@ function netAt(f: FieldData, px: number, py: number, pz: number, slack0: number)
  * meanders and valleys gain octaves as the pixel size shrinks, so every zoom
  * level adds detail while agreeing with the levels above it.
  */
+/** Spacing (px) of the ocean-current arrows: a divisor of the tile, so the lattice wraps at the date line. */
+const CURRENT_ARROW_SP = 32;
+
+/** The current sampled by curAt: eastward and northward speed (m/s); NaN where the point isn't open sea. */
+let curVE = 0;
+let curVN = 0;
+let curTri = -1;
+
+/** Gather the surface current at a point from the ocean cells around it (into curVE/curVN). */
+function curAt(md: MeshData, f: FieldData, lat: number, lon: number, kr2: number): void {
+  const cl = Math.cos(lat);
+  const px = cl * Math.cos(lon);
+  const py = cl * Math.sin(lon);
+  const pz = Math.sin(lat);
+  curTri = curTri < 0 ? seedTriangle(md, lat, lon) : locate(md, px, py, pz, curTri);
+  const { x: mx, y: my, z: mz, gStart, gCell } = md;
+  const { ocean, curE, curN } = f;
+  let sw = 0;
+  let swO = 0;
+  let se = 0;
+  let sn = 0;
+  for (let k = gStart[curTri], e = gStart[curTri + 1]; k < e; k++) {
+    const q = gCell[k];
+    const dx = px - mx[q];
+    const dy = py - my[q];
+    const dz = pz - mz[q];
+    const d2 = dx * dx + dy * dy + dz * dz;
+    if (d2 >= kr2) continue;
+    let w = 1 - d2 / kr2;
+    w *= w;
+    sw += w;
+    if (!ocean[q]) continue;
+    swO += w;
+    se += w * curE[q];
+    sn += w * curN[q];
+  }
+  if (swO <= 0 || swO <= 0.6 * sw) {
+    curVE = curVN = NaN;
+    return;
+  }
+  curVE = se / swO;
+  curVN = sn / swO;
+}
+
+/**
+ * Flow arrows on the ocean-currents layer (ARW/ARO): one per block of a
+ * staggered lattice over the sea, pointing along the surface current, longer
+ * and bolder where it runs faster. Each block samples the current on a 4×4
+ * grid and puts its arrow where the flow is fastest when that clearly beats
+ * the block's centre, so narrow boundary currents get their arrows. Blocks
+ * and samples sit on the global pixel grid, so tiles agree.
+ */
+function rasterCurrents(md: MeshData, f: FieldData, x0g: number, y0g: number, Wg: number, Hg: number, dRad: number): void {
+  const S = CURRENT_ARROW_SP;
+  const HL = Math.round(Math.PI / dRad);
+  const margin = 14;
+  const kr2 = (KERNEL_RADIUS * md.spacing) ** 2;
+  const ky0 = Math.max(0, Math.floor((y0g - margin) / S) - 1);
+  const ky1 = Math.floor((y0g + Hg + margin) / S);
+  curTri = -1;
+  for (let ky = ky0; ky <= ky1; ky++) {
+    if (ky * S >= HL) break;
+    // Alternate rows of blocks sit half a step over: an even scatter, not columns.
+    const off = ky & 1 ? 0 : S / 2;
+    const kx0 = Math.floor((x0g - margin - off) / S) - 1;
+    const kx1 = Math.floor((x0g + Wg + margin - off) / S);
+    for (let kx = kx0; kx <= kx1; kx++) {
+      const bx = kx * S + off;
+      const by = ky * S;
+      // The block's centre, then its 4×4 samples.
+      let gx = bx + S / 2;
+      let gy = by + S / 2;
+      curAt(md, f, Math.PI / 2 - (gy + 0.5) * dRad, -Math.PI + (gx + 0.5) * dRad, kr2);
+      let vE = curVE;
+      let vN = curVN;
+      const sc = Number.isNaN(vE) ? -1 : Math.hypot(vE, vN);
+      let best = sc;
+      let bE = vE;
+      let bN = vN;
+      let bxg = gx;
+      let byg = gy;
+      for (let j = 0; j < 4; j++) {
+        const sy = by + 4 + 8 * j;
+        if (sy >= HL) break;
+        const lat = Math.PI / 2 - (sy + 0.5) * dRad;
+        for (let i = 0; i < 4; i++) {
+          const sx = bx + 4 + 8 * i;
+          curAt(md, f, lat, -Math.PI + (sx + 0.5) * dRad, kr2);
+          if (Number.isNaN(curVE)) continue;
+          const s = Math.hypot(curVE, curVN);
+          if (s > best) {
+            best = s;
+            bE = curVE;
+            bN = curVN;
+            bxg = sx;
+            byg = sy;
+          }
+        }
+      }
+      if (best < 0) continue;
+      if (sc >= 0 && best <= 1.3 * sc + 0.05) {
+        best = sc;
+      } else {
+        vE = bE;
+        vN = bN;
+        gx = bxg;
+        gy = byg;
+      }
+      if (best < 0.012) continue;
+      const len = 6 + 12 * Math.min(1, best / 1.2);
+      const alpha = smooth01((best - 0.012) / 0.06);
+      stampArrow(gx - x0g, gy - y0g, vE / best, -vN / best, len, 0.75 * len, alpha, Wg, Hg);
+    }
+  }
+}
+
 export function renderWindow(ctx: RenderContext, opt: RenderOptions, win: PixelWindow, wantElevation = false): RenderResult {
   const md = ctx.mesh;
   const f = ctx.fields;
@@ -3344,9 +3759,11 @@ export function renderWindow(ctx: RenderContext, opt: RenderOptions, win: PixelW
   rasterRivers(md, f, L, x0g, y0g, Wg, Hg, dRad, showRivers, carveOn, lcode);
   // Deltas, fans and inland deltas: their plains shape the coast whether or not rivers show.
   rasterNetworks(md, f, L, x0g, y0g, Wg, Hg, dRad, showRivers, lcode);
+  if (lcode === L_CURRENTS) rasterCurrents(md, f, x0g, y0g, Wg, Hg, dRad);
 
   const { x: mx, y: my, z: mz, gStart, gCell, tri } = md;
   const { elev, grad, amp, mtn, ocean, lake, lakeWet, lakeLevel, lakeKind, reef, color, dryness, ice, iceCover, iceMelt, shelf, scour, fjord, strand, cellNet } = f;
+  const cellF = cellFlags(f);
   const kr2 = (KERNEL_RADIUS * h) ** 2;
   const invKr2 = 1 / kr2;
   const f0 = 0.75 / h;
@@ -3354,6 +3771,11 @@ export function renderWindow(ctx: RenderContext, opt: RenderOptions, win: PixelW
   const fb = lc.b;
   const modeA = lc.modeA;
   const modeB = lc.modeB;
+  // (Which cells each layer field gathers from, decided once for the window.)
+  const aSea = fa !== null && modeA !== MODE_LAND;
+  const bSea = fb !== null && modeB !== MODE_LAND;
+  const aLand = fa !== null && modeA !== MODE_SEA;
+  const bLand = fb !== null && modeB !== MODE_SEA;
   const wantColor = lcode === L_TERRAIN;
   const needCat = CATEGORICAL.has(lcode);
   const ringW = Math.max(1.2 * dRad, 0.008 * h);
@@ -3364,6 +3786,11 @@ export function renderWindow(ctx: RenderContext, opt: RenderOptions, win: PixelW
   const netSlack = 1500 / R;
   /** Any network's ground reaching this tile (their boxes hold their cells' kernels). */
   const netsHere = tileNetN > 0;
+  if (tileSlack.length < tileNetN) tileSlack = new Float64Array(tileCos.length);
+  for (let k = 0; k < tileNetN; k++) {
+    const io = NET_INFO * tileNets[k];
+    tileSlack[k] = f.netInfo[io] === 0 ? Math.max(netSlack, 1.2 * deltaRag(f.netInfo[io + 5], f.netInfo[io + 2])) : netSlack;
+  }
 
   // Domain warp for categorical boundaries, so they wander instead of tracing
   // the cells' straight Voronoi edges (blocky once cells span a few pixels).
@@ -3389,7 +3816,7 @@ export function renderWindow(ctx: RenderContext, opt: RenderOptions, win: PixelW
           let a = 1;
           let fr = f0;
           for (let k = 0; k < warpOct; k++) {
-            s += a * noise.noise(px * fr + 41.7 * c + 3.1 * k, py * fr - 13.3 * c, pz * fr + 7.9 * c - 5.3 * k);
+            s += a * snoise(px * fr + 41.7 * c + 3.1 * k, py * fr - 13.3 * c, pz * fr + 7.9 * c - 5.3 * k);
             a *= 0.5;
             fr *= 2;
           }
@@ -3480,36 +3907,44 @@ export function renderWindow(ctx: RenderContext, opt: RenderOptions, win: PixelW
         let w = 1 - d2 * invKr2;
         w *= w;
         const v = elev[q] + grad[3 * q] * dx + grad[3 * q + 1] * dy + grad[3 * q + 2] * dz;
+        // (Fields that are zero or absent for most cells are read only where the cell has them.)
+        const cf = cellF[q];
         sw += w;
         sA += w * amp[q];
         sM += w * mtn[q];
-        sScour += w * scour[q];
-        sFjord += w * fjord[q];
-        sStrand += w * strand[q];
+        if (cf & CF_GLACIAL) {
+          sScour += w * scour[q];
+          sFjord += w * fjord[q];
+          sStrand += w * strand[q];
+        }
         if (ocean[q]) {
           swO += w;
           seO += w * v;
           sChi -= w;
-          sShelf += w * shelf[q];
+          if (cf & CF_SHELF) sShelf += w * shelf[q];
           if (w > bestOw) {
             bestOw = w;
             bestO = q;
           }
-          const rf = reef[q];
-          if (rf === 1) {
-            if (nAt < 4) AT[nAt++] = q;
-          } else if (rf === 2) sReef += w;
-          if (fa !== null && modeA !== MODE_LAND) sa += w * fa[q];
-          if (fb !== null && modeB !== MODE_LAND) sb += w * fb[q];
+          if (cf & CF_REEF) {
+            const rf = reef[q];
+            if (rf === 1) {
+              if (nAt < 4) AT[nAt++] = q;
+            } else if (rf === 2) sReef += w;
+          }
+          if (aSea) sa += w * fa![q];
+          if (bSea) sb += w * fb![q];
         } else {
           swL += w;
           seL += w * v;
           sChi += w;
-          sIce += w * ice[q];
-          sCov += w * iceCover[q];
-          sMelt += w * iceMelt[q];
-          const cn = netsHere ? cellNet[q] : -1;
-          if (cn >= 0) {
+          if (cf & CF_ICE) {
+            sIce += w * ice[q];
+            sCov += w * iceCover[q];
+            sMelt += w * iceMelt[q];
+          }
+          if (netsHere && cf & CF_NET) {
+            const cn = cellNet[q];
             sNet += w;
             if (w > netCellW) {
               netCellW = w;
@@ -3520,8 +3955,8 @@ export function renderWindow(ctx: RenderContext, opt: RenderOptions, win: PixelW
             bestLw = w;
             bestL = q;
           }
-          const lk = lake[q];
-          if (lk >= 0) {
+          if (cf & CF_LAKE) {
+            const lk = lake[q];
             sLake += w;
             sWet += w * lakeWet[q];
             if (w > lakeW) {
@@ -3535,8 +3970,8 @@ export function renderWindow(ctx: RenderContext, opt: RenderOptions, win: PixelW
             cb += w * color[3 * q + 2];
             sDry += w * dryness[q];
           }
-          if (fa !== null && modeA !== MODE_SEA) sa += w * fa[q];
-          if (fb !== null && modeB !== MODE_SEA) sb += w * fb[q];
+          if (aLand) sa += w * fa![q];
+          if (bLand) sb += w * fb![q];
         }
       }
       if (sw <= 0) {
@@ -3599,8 +4034,15 @@ export function renderWindow(ctx: RenderContext, opt: RenderOptions, win: PixelW
             // (Broad, smooth lobes, and only the fine raggedness of any coast on
             // top: a front of lobes and bays, not a spray of islets off it.)
             const fN = Math.max(f0 * 1.1, 2.4 / Math.max(f.netInfo[io + 5], 1e-6));
-            const lob = netGap > 1.2 * amp ? 0 : noise.noise(px * fN + 11.3, py * fN - 7.7, pz * fN + 3.1) + 0.45 * noise.noise(px * fN * 2.1 - 5.1, py * fN * 2.1 + 9.3, pz * fN * 2.1 - 1.7);
-            deltaLand = netGap > 1.2 * amp ? true : netGap + 0.55 * amp * lob + 0.5 * netSlack * raggedEdge(noise, px, py, pz, f0 * 3, K) > 0;
+            // (The lobes and the ragged edge move the shore at most bL and bR:
+            // beyond that either way the answer needs neither.)
+            const bL = 0.55 * amp * 1.45 * NOISE_MAX;
+            const bR = netSlack * NOISE_MAX + 1e-9;
+            if (netGap > 1.2 * amp || netGap - bL - bR > 0) deltaLand = true;
+            else if (netGap + bL + bR > 0) {
+              const lob = snoise(px * fN + 11.3, py * fN - 7.7, pz * fN + 3.1) + 0.45 * snoise(px * fN * 2.1 - 5.1, py * fN * 2.1 + 9.3, pz * fN * 2.1 - 1.7);
+              deltaLand = raggedAbove(px, py, pz, f0 * 3, K, netGap + 0.55 * amp * lob, 0.5 * netSlack, 0);
+            }
           }
         }
         if (LEVEE[p] > 0.5) deltaLand = true;
@@ -3682,11 +4124,11 @@ export function renderWindow(ctx: RenderContext, opt: RenderOptions, win: PixelW
             // left (finer ones appear as you zoom in), thinning out smoothly
             // toward unscoured or mountainous ground.
             const sc = sScour / sw;
-            let nl = 0.7 * noise.noise(px * fScour + 211.7, py * fScour - 63.1, pz * fScour + 17.9);
-            if (hPx >= 56) nl += 0.45 * noise.noise(px * fScour * 2.8 - 91.3, py * fScour * 2.8 + 44.4, pz * fScour * 2.8 + 8.8);
+            let nl = 0.7 * snoise(px * fScour + 211.7, py * fScour - 63.1, pz * fScour + 17.9);
+            if (hPx >= 56) nl += 0.45 * snoise(px * fScour * 2.8 - 91.3, py * fScour * 2.8 + 44.4, pz * fScour * 2.8 + 8.8);
             // Their shores keep gaining detail at the deepest levels.
-            if (hPx >= 150) nl += 0.25 * noise.noise(px * fScour * 7.6 + 30.1, py * fScour * 7.6 - 12.7, pz * fScour * 7.6 + 61.3);
-            if (hPx >= 400) nl += 0.14 * noise.noise(px * fScour * 20.5 - 4.9, py * fScour * 20.5 + 77.2, pz * fScour * 20.5 - 33.6);
+            if (hPx >= 150) nl += 0.25 * snoise(px * fScour * 7.6 + 30.1, py * fScour * 7.6 - 12.7, pz * fScour * 7.6 + 61.3);
+            if (hPx >= 400) nl += 0.14 * snoise(px * fScour * 20.5 - 4.9, py * fScour * 20.5 + 77.2, pz * fScour * 20.5 - 33.6);
             const thr = 0.95 - 0.6 * sc + 0.8 * smooth01(M / 0.6);
             if (nl > thr) {
               cls = LAKE;
@@ -3721,18 +4163,18 @@ export function renderWindow(ctx: RenderContext, opt: RenderOptions, win: PixelW
           // shallow sounds, clustered into archipelagos (finer ones as you zoom in).
           const wS = smooth01((stK - 0.04) / 0.36);
           const fs = R / 3200;
-          const plat = -4 - 26 * (0.5 + 0.5 * noise.noise(px * fs * 0.6 - 17.9, py * fs * 0.6 + 3.1, pz * fs * 0.6 + 44.2));
+          const plat = -4 - 26 * (0.5 + 0.5 * snoise(px * fs * 0.6 - 17.9, py * fs * 0.6 + 3.1, pz * fs * 0.6 + 44.2));
           if (e < plat) e += (plat - e) * wS;
           if (swL > 0 && e > -45) {
             let kn = 0;
             let a = 1;
             let fr = fs;
             for (let k = 0, nk = Math.max(2, Math.min(7, K - 2)); k < nk; k++) {
-              kn += a * noise.noise(px * fr + 71.3 - 9.7 * k, py * fr - 13.1 + 4.9 * k, pz * fr + 29.5);
+              kn += a * snoise(px * fr + 71.3 - 9.7 * k, py * fr - 13.1 + 4.9 * k, pz * fr + 29.5);
               a *= 0.5;
               fr *= 2.1;
             }
-            const arch = noise.noise(px * fs * 0.12 + 5.5, py * fs * 0.12 - 61.7, pz * fs * 0.12 + 12.3);
+            const arch = snoise(px * fs * 0.12 + 5.5, py * fs * 0.12 - 61.7, pz * fs * 0.12 + 12.3);
             const thr = 0.62 - 0.3 * wS - 0.14 * arch;
             if (kn > thr) {
               cls = LAND;
@@ -3743,8 +4185,7 @@ export function renderWindow(ctx: RenderContext, opt: RenderOptions, win: PixelW
         const shelfK = sShelf / swO;
         if (shelfK > 0.05) {
           // Floating ice shelf with a ragged calving front.
-          const front = raggedEdge(noise, px, py, pz, f0 * 3, K);
-          if (shelfK + 0.3 * front > 0.55) {
+          if (raggedAbove(px, py, pz, f0 * 3, K, shelfK, 0.3, 0.55)) {
             flags = F_SHELF;
             e = -1;
           }
@@ -3769,9 +4210,11 @@ export function renderWindow(ctx: RenderContext, opt: RenderOptions, win: PixelW
           // tens of kilometres across hold them, the higher ground between
           // has few or none.
           const fcl = R / 26000;
-          const cl0 = noise.noise(px * fcl - 61.3, py * fcl + 17.9, pz * fcl + 44.1) + 0.5 * noise.noise(px * fcl * 2.3 + 8.1, py * fcl * 2.3 - 3.7, pz * fcl * 2.3 + 91.2);
+          const d0 = (kind === 2 ? 0.5 : 0.04 + 0.26 * smooth01((dRho - 0.45) / 0.4)) * wet * smooth01((plainW - 0.6) / 0.3);
+          // (The clustering at most multiplies the density by 2.4: too sparse even so, no lake here.)
+          const cl0 = d0 * 2.4 > 0.005 ? snoise(px * fcl - 61.3, py * fcl + 17.9, pz * fcl + 44.1) + 0.5 * snoise(px * fcl * 2.3 + 8.1, py * fcl * 2.3 - 3.7, pz * fcl * 2.3 + 91.2) : -1;
           const cluster = 2.4 * smooth01((cl0 + 0.05) / 0.7);
-          const density = (kind === 2 ? 0.5 : 0.04 + 0.26 * smooth01((dRho - 0.45) / 0.4)) * wet * smooth01((plainW - 0.6) / 0.3) * cluster;
+          const density = d0 * cluster;
           if (density > 0.005) {
             // (The pixel's own longitude, from its column.)
             let lon = -Math.PI + (x0g + i + 0.5) * dRad;
@@ -3806,14 +4249,14 @@ export function renderWindow(ctx: RenderContext, opt: RenderOptions, win: PixelW
           d2min = Math.min(d2min, dx * dx + dy * dy + dz * dz);
         }
         const dist = Math.sqrt(d2min);
-        const wob = noise.noise(px * f0 * 4 + 7.7, py * f0 * 4, pz * f0 * 4 - 2.2);
+        const wob = snoise(px * f0 * 4 + 7.7, py * f0 * 4, pz * f0 * 4 - 2.2);
         const ringR = 0.16 * h * (1 + 0.25 * wob);
         if (dist < ringR - ringW) {
           e = -10 - 26 * (1 - dist / ringR);
           cls = SEA;
           atollZone = 1;
         } else if (dist <= ringR + ringW) {
-          motu = noise.noise(px * fMotu - 3.3, py * fMotu + 1.9, pz * fMotu);
+          motu = snoise(px * fMotu - 3.3, py * fMotu + 1.9, pz * fMotu);
           if (motu > 0.2) {
             e = 2 + 4 * (motu - 0.2);
             cls = LAND;
@@ -3915,8 +4358,9 @@ export function renderWindow(ctx: RenderContext, opt: RenderOptions, win: PixelW
                 const kind = f.netInfo[io];
                 const dryN = f.netInfo[io + 7];
                 if (kind === 1) {
-                  // A fan: gravel and sand, bare in dry country.
-                  const k = (0.12 + 0.5 * dryN) * (1 - 0.4 * dRho) * plainW;
+                  // A fan: a cone of pale gravel and sand, nearly bare in dry
+                  // country, grassed or wooded between its washes in wet.
+                  const k = (0.3 + 0.5 * dryN) * (1 - 0.35 * dRho) * plainW;
                   r += (196 - r) * k;
                   g += (182 - g) * k;
                   b += (152 - b) * k;
@@ -3938,7 +4382,7 @@ export function renderWindow(ctx: RenderContext, opt: RenderOptions, win: PixelW
                         g += (146 - g) * kf;
                         b += (122 - b) * kf;
                         const fc = R / 1400;
-                        const cn = Math.abs(noise.noise(px * fc - 3.7, py * fc + 21.1, pz * fc - 8.4));
+                        const cn = Math.abs(snoise(px * fc - 3.7, py * fc + 21.1, pz * fc - 8.4));
                         const kc = kf * (1 - smooth01((cn - 0.02) / 0.03)) * smooth01(1 / (fc * dRad) / 3 - 1);
                         r += (84 - r) * kc;
                         g += (116 - g) * kc;
@@ -4168,6 +4612,17 @@ export function renderWindow(ctx: RenderContext, opt: RenderOptions, win: PixelW
           else if (flags & F_ICE) [r, g, b] = SOIL_INFO[12].color;
           else [r, g, b] = pal.ramp(pal.FERTILITY, sa / swL);
           break;
+        case L_CURRENTS:
+          if (cls === SEA) {
+            // The current's warmth or chill, a little darker over the deep ocean.
+            [r, g, b] = pal.ramp(pal.CURRENT_ANOM, swO > 0 ? sb / swO : 0);
+            const k = 0.82 + 0.18 * smooth01((e + 5000) / 4800);
+            r *= k;
+            g *= k;
+            b *= k;
+          } else if (water) [r, g, b] = [128, 150, 172];
+          else [r, g, b] = [146, 142, 136];
+          break;
       }
       CR[p] = r;
       CG[p] = g;
@@ -4188,6 +4643,7 @@ export function renderWindow(ctx: RenderContext, opt: RenderOptions, win: PixelW
   const dy = R * dRad;
   const shadeK = SHADE_K[lcode];
   const lineR = L >= 5 ? 2 : 1;
+  const outlined = OUTLINED.has(lcode);
   const riverCol = lcode === L_TERRAIN ? [58, 100, 140] : [40, 90, 200];
   const lakeCol = lcode === L_TERRAIN ? [70, 124, 156] : [90, 140, 200];
   for (let j = 0; j < H; j++) {
@@ -4235,12 +4691,12 @@ export function renderWindow(ctx: RenderContext, opt: RenderOptions, win: PixelW
           g += (243 - g) * snow;
           b += (247 - b) * snow;
         } else k = cls === SEA && !(fl & F_SHELF) ? 0.5 : 0;
-      }
+      } else if (lcode === L_CURRENTS && !isLand) k = 0.12;
       s = 1 + (s - 1) * k;
       r *= s;
       g *= s;
       b *= s;
-      if (OUTLINED.has(lcode) && isLand) {
+      if (outlined && isLand) {
         if (CLS[p + 1] !== LAND || CLS[p + Wg] !== LAND || CLS[p - 1] !== LAND || CLS[p - Wg] !== LAND) {
           r *= 0.35;
           g *= 0.35;
@@ -4292,7 +4748,7 @@ export function renderWindow(ctx: RenderContext, opt: RenderOptions, win: PixelW
           b += (col[2] - b) * a;
         }
       }
-      if (lcode === L_DRAIN && showRivers) {
+      if ((lcode === L_DRAIN && showRivers) || (lcode === L_CURRENTS && cls === SEA)) {
         // Flow arrows: a dark outline, then a white arrowhead.
         const ao = ARO[p];
         if (ao > 0) {

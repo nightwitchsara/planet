@@ -78,6 +78,17 @@ export const PRECIP: Stops = [
   [5000, [70, 30, 120]],
 ];
 
+/** Sea-temperature anomaly a current carries (°C): cold blues through pale neutral to warm reds. */
+export const CURRENT_ANOM: Stops = [
+  [-8, [30, 62, 150]],
+  [-4, [74, 124, 204]],
+  [-1.5, [168, 198, 232]],
+  [0, [228, 232, 236]],
+  [1.5, [240, 204, 170]],
+  [4, [226, 122, 78]],
+  [8, [168, 34, 38]],
+];
+
 export const OCEAN_AGE: Stops = [
   [0, [240, 60, 50]],
   [20, [250, 160, 60]],

@@ -281,6 +281,8 @@ export const slopeScale = (n: number): number => detailRatio(n) ** -0.225;
 
 /** Open water evaporates a little faster than the land reference surface. */
 const LAKE_EVAPORATION = 1.1;
+/** Floor area (km²) whose floods a closed hollow's inflow must be able to wet now and then to leave a salt flat or marsh. */
+const FLAT_MIN_KM2 = 1000;
 /**
  * Spread of ground heights within a cell, as a share of its sub-cell relief
  * (the relief the renderer draws, plus a floor for the smoothest plains).
@@ -385,6 +387,8 @@ export function computeHydrology(
   routing: Routing = route(mesh, elev, ocean),
   shoresDone = false,
   closedIn?: ClosedBasins,
+  /** History slices: lakes may pond against the ice sheets (today's world drains them under the ice). */
+  opts: { iceDammedLakes?: boolean } = {},
 ): Hydrology {
   const { n, area, x, y, z } = mesh;
   const { order, receiver, basin, count } = routing;
@@ -451,7 +455,7 @@ export function computeHydrology(
     // (Dammed by ice: its way out runs onto the ice within a few cells.)
     let dammed = false;
     for (let c = outlet, k = 0; c >= 0 && k < 4 && !dammed; c = routing.receiver[c], k++) dammed = nearIce(c) === 1;
-    if (!closedG?.[g] && (dammed || iced > 0)) return;
+    if (!opts.iceDammedLakes && !closedG?.[g] && (dammed || iced > 0)) return;
     const cells = all;
     const spill = spillOf[g];
     if (cells.length === 0 || spill - elev[cells[0]] < 3) return;
@@ -546,11 +550,12 @@ export function computeHydrology(
       }
       const kind = moisture < 0.6 ? LakeKind.Saline : LakeKind.Fresh;
       lakes.push({ kind, level: Math.min(spill, top + 2), areaKm2, inflow, outflow: 0, outlet });
-    } else if (inflow > 0.15 * annualCost(floorCell)) {
+    } else if (inflow > 0.15 * annualCost(floorCell) * Math.min(1, FLAT_MIN_KM2 / (area[floorCell] * R2))) {
       // Too little water for a lasting lake: floods now and then spread over
       // the lowest ground (sized for floods of about three years' inflow). In
       // dry country they evaporate to a salt flat; in wetter country the
-      // hollow is a marsh.
+      // hollow is a marsh. (Measured against at most FLAT_MIN_KM2 of floor, so
+      // a coarse mesh's huge floor cell doesn't let a sizeable river vanish.)
       const floor = elev[floorCell];
       let areaKm2 = 0;
       let wet = 0;
@@ -599,7 +604,7 @@ export function computeHydrology(
   // instead of being pooled for a lake that never forms and lost there.
   for (let b = 0; b < routing.basinSpill.length; b++) {
     const g = groupOf[b];
-    if (shallow[g] || closedIn?.closed[g]) continue;
+    if (opts.iceDammedLakes || shallow[g] || closedIn?.closed[g]) continue;
     let iced = false;
     for (let c = routing.basinSpill[b], k = 0; c >= 0 && k < 4 && !iced; c = routing.receiver[c], k++) iced = nearIce(c) === 1;
     for (let j = 0; j < pits[g].length && !iced; j++) iced = nearIce(pits[g][j]) === 1;
@@ -715,7 +720,7 @@ export function computeHydrology(
     for (let g = 0; g < groups && !any; g++) any = closedNow[g] === 1;
     if (any) {
       const r2 = rerouteClosed(mesh, routing, elev, ocean, pits, closedNow);
-      if (r2) return computeHydrology(mesh, elev, ocean, wb, precip, temp, slope, rough, radiusKm, r2, true, { closed: closedNow, lake });
+      if (r2) return computeHydrology(mesh, elev, ocean, wb, precip, temp, slope, rough, radiusKm, r2, true, { closed: closedNow, lake }, opts);
     }
   }
 

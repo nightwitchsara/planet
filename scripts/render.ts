@@ -3,6 +3,7 @@
  *   npx tsx scripts/render.ts [seed] [outDir] [layers...]
  * env: CELLS, W (overview width, default 2048), MONTHS=0,6,
  *      ZOOM="lat,lon,level[,w,h];…" renders close-ups centered on each point.
+ *      HISTORY_KA=21,14,0 renders everything again for each slice of the history (prefix t<ka>-).
  */
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { deflateSync } from 'node:zlib';
@@ -19,6 +20,7 @@ const layers = (process.argv.slice(4).length ? process.argv.slice(4) : ['terrain
 mkdirSync(outDir, { recursive: true });
 
 const t0 = performance.now();
+World.historyOnGenerate = !!process.env.HISTORY_KA;
 const world = World.generate({ ...DEFAULT_PARAMS, seed, cells: Number(process.env.CELLS ?? DEFAULT_PARAMS.cells) });
 console.log(`generate: ${(performance.now() - t0).toFixed(0)} ms`, Object.fromEntries(Object.entries(world.timings).map(([k, v]) => [k, Math.round(v)])));
 console.log(`plates ${world.geo.plates.length}, land ${(world.landFraction() * 100).toFixed(1)}%`);
@@ -153,7 +155,7 @@ for (const l of world.historyLog) console.log('  ' + l);
 }
 
 const t1 = performance.now();
-const ctx = { mesh: meshData(world.fine, 'headless'), fields: buildFields(world, 'headless', 1) };
+let ctx = { mesh: meshData(world.fine, 'headless'), fields: buildFields(world, 'headless', 1) };
 console.log(`render context: ${(performance.now() - t1).toFixed(0)} ms, ${ctx.fields.rivStart.length - 1} river chains`);
 
 async function save(name: string, rgba: Uint8ClampedArray, w: number, h: number): Promise<void> {
@@ -169,11 +171,25 @@ async function save(name: string, rgba: Uint8ClampedArray, w: number, h: number)
 const W = Number(process.env.W ?? 2048);
 const level = levelForWidth(W);
 const months = process.env.MONTHS ? process.env.MONTHS.split(',').map(Number) : [-1];
+const times = process.env.HISTORY_KA ? process.env.HISTORY_KA.split(',').map(Number) : [null];
+for (const ka of times) {
+  let pre = '';
+  if (ka !== null) {
+    const tv = performance.now();
+    world.viewTime(ka);
+    ctx = { mesh: ctx.mesh, fields: buildFields(world, 'headless', 2 + ka) };
+    pre = `t${ka}-`;
+    console.log(`view ${ka} ka: ${(performance.now() - tv).toFixed(0)} ms, land ${(world.landFraction() * 100).toFixed(1)}%`);
+  }
+  await renderAll(pre);
+}
+
+async function renderAll(pre: string): Promise<void> {
 for (const layer of layers) {
   for (const month of months) {
     const t2 = performance.now();
     const { rgba } = renderWindow(ctx, { layer, month, rivers: true }, { level, x0: 0, y0: 0, w: levelWidth(level), h: levelHeight(level) });
-    const name = month >= 0 ? `${layer}-m${month + 1}` : layer;
+    const name = pre + (month >= 0 ? `${layer}-m${month + 1}` : layer);
     console.log(`${name}: ${(performance.now() - t2).toFixed(0)} ms`);
     await save(name, rgba, levelWidth(level), levelHeight(level));
   }
@@ -189,6 +205,7 @@ for (const spec of (process.env.ZOOM ?? '').split(';').filter(Boolean)) {
     const { rgba } = renderWindow(ctx, { layer, month: -1, rivers: true }, win);
     const ms = performance.now() - t3;
     console.log(`zoom ${lat},${lon} L${L} ${layer}: ${ms.toFixed(0)} ms (${((ms * 65536) / (w * h)).toFixed(1)} ms per 256² tile)`);
-    await save(`zoom-${lat}_${lon}-L${L}-${layer}`, rgba, w, h);
+    await save(`${pre}zoom-${lat}_${lon}-L${L}-${layer}`, rgba, w, h);
   }
+}
 }

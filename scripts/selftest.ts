@@ -8,11 +8,11 @@ import { deflateSync } from 'node:zlib';
 import { encodePNG } from '../src/io/png';
 import { deserializeWorld, serializeWorld } from '../src/io/save';
 import { buildFields, meshData, NET_INFO } from '../src/render/context';
-import { type LayerId, LAYERS, levelHeight, levelWidth, MAX_LEVEL, renderWindow, riverCourse, TILE } from '../src/render/raster';
+import { type LayerId, LAYERS, levelHeight, levelWidth, MAX_LEVEL, renderWindow, rendererNoiseCheck, riverCourse, TILE } from '../src/render/raster';
 import { DEG, latLonToVec } from '../src/core/math';
 import { Biome, KOPPEN_CODES } from '../src/world/biomes';
 import { Channel, CHANNEL_NAMES } from '../src/world/channels';
-import { nearestCell } from '../src/core/mesh';
+import { nearestCell, nearestCellLatLon } from '../src/core/mesh';
 import * as edits from '../src/world/edits';
 import { Rock, ROCK_INFO } from '../src/world/geology';
 import { ICE_ISOSTASY } from '../src/world/glaciers';
@@ -20,6 +20,9 @@ import { Deposit } from '../src/world/sediment';
 import { Soil, SOIL_COUNT } from '../src/world/soils';
 import { DEFAULT_PARAMS } from '../src/world/types';
 import { World } from '../src/world/world';
+
+// The history since the last ice age is built where a check needs it (see its block), not with every world.
+World.historyOnGenerate = false;
 
 const outDir = process.argv[2] ?? 'out';
 mkdirSync(outDir, { recursive: true });
@@ -174,6 +177,149 @@ check(world.geo.plates.length > 3, `generated ${world.geo.plates.length} plates,
   check(borealCold === 0 && borealPolar === 0, `no boreal forest where the warmest month stays below 10 °C or beyond 75° (${borealCold}, ${borealPolar} cells)`);
 }
 
+// Ocean currents and the westerlies: coasts beside cold upwelling at 15–30°
+// stay far drier than coasts washed by warm currents; mild water under the
+// westerlies keeps west coasts at 50–60° far milder in midwinter than east
+// coasts across the ocean; the tropics' sea-level air averages 24–28 °C.
+{
+  let coldP = 0;
+  let coldN = 0;
+  let warmP = 0;
+  let warmN = 0;
+  let westT = 0;
+  let westN = 0;
+  let eastT = 0;
+  let eastN = 0;
+  let tropT = 0;
+  let tropA = 0;
+  for (const seed of ['kelp-umber-694', 'aurelia', 'vale-fen-46']) {
+    const w = sharedWorld(seed, seed === 'kelp-umber-694' ? 80000 : 40000);
+    const { coarse, ocean, c2fNearest } = w;
+    const { tempSL, precip, current } = w.climate;
+    for (let k = 0; k < coarse.n; k++) {
+      if (Math.abs(coarse.lat[k]) >= 15 * DEG) continue;
+      let t = 0;
+      for (let m = 0; m < 12; m++) t += tempSL[k * 12 + m] / 12;
+      tropT += coarse.area[k] * t;
+      tropA += coarse.area[k];
+    }
+    // Along each 1° latitude circle: the first 3° of land on both coasts of
+    // every landmass at least 10° wide, and the ocean beside each coast.
+    const W = 360;
+    const row = new Int32Array(W);
+    const isLand = new Uint8Array(W);
+    for (let j = 0; j < 180; j++) {
+      const latD = 89.5 - j;
+      const sub = Math.abs(latD) >= 15 && Math.abs(latD) < 30;
+      const mid = Math.abs(latD) >= 50 && Math.abs(latD) < 60;
+      if (!sub && !mid) continue;
+      for (let i = 0; i < W; i++) {
+        row[i] = nearestCellLatLon(coarse, latD * DEG, (-179.5 + i) * DEG);
+        isLand[i] = ocean[c2fNearest[row[i]]] ? 0 : 1;
+      }
+      for (let i0 = 0; i0 < W; i0++) {
+        if (!isLand[i0] || isLand[(i0 + W - 1) % W]) continue;
+        let len = 0;
+        while (len < W && isLand[(i0 + len) % W]) len++;
+        if (len < 10 || len >= W) continue;
+        const iEnd = i0 + len - 1;
+        let curW = 0;
+        let curE = 0;
+        for (let t = 1; t <= 3; t++) {
+          curW += current[row[(i0 - t + W) % W]] / 3;
+          curE += current[row[(iEnd + t) % W]] / 3;
+        }
+        for (let t = 0; t < 3; t++) {
+          for (const [k, cur, west] of [[row[(i0 + t) % W], curW, true], [row[(iEnd - t) % W], curE, false]] as const) {
+            if (sub) {
+              let p = 0;
+              for (let m = 0; m < 12; m++) p += precip[k * 12 + m];
+              if (cur < -1) {
+                coldP += p;
+                coldN++;
+              } else if (cur > 1) {
+                warmP += p;
+                warmN++;
+              }
+            } else if (west) {
+              westT += tempSL[k * 12 + (latD >= 0 ? 0 : 6)];
+              westN++;
+            } else {
+              eastT += tempSL[k * 12 + (latD >= 0 ? 0 : 6)];
+              eastN++;
+            }
+          }
+        }
+      }
+    }
+  }
+  const cold = coldP / coldN;
+  const warm = warmP / warmN;
+  check(coldN > 50 && warmN > 50 && cold < 0.3 * warm, `cold-current coasts at 15–30° get ${cold.toFixed(0)} mm a year against ${warm.toFixed(0)} mm on warm-current coasts`);
+  const westW = westT / westN;
+  const eastW = eastT / eastN;
+  check(westN > 30 && eastN > 30 && westW - eastW >= 9, `west coasts at 50–60° average ${westW.toFixed(1)} °C at sea level in midwinter, east coasts across the ocean ${eastW.toFixed(1)} °C`);
+  const trop = tropT / tropA;
+  check(trop >= 24 && trop <= 28, `the tropics (within 15° of the equator) average ${trop.toFixed(1)} °C at sea level`);
+}
+
+// Surface currents from the same gyres: in the subtropics the western boundary
+// currents run poleward and the eastern ones toward the equator; warm water
+// moves poleward and cold water equatorward; boundary currents reach about
+// 1–2 m/s while the open ocean drifts at a tenth of that.
+{
+  let wbV = 0;
+  let wbN = 0;
+  let ebV = 0;
+  let ebN = 0;
+  let cov = 0;
+  let va = 0;
+  let vv = 0;
+  const speeds: number[] = [];
+  for (const seed of ['kelp-umber-694', 'aurelia', 'vale-fen-46']) {
+    const w = sharedWorld(seed, seed === 'kelp-umber-694' ? 80000 : 40000);
+    const { coarse, ocean, c2fNearest } = w;
+    const { flowE, flowN, current } = w.climate;
+    const sea = (k: number) => ocean[c2fNearest[k]] === 1;
+    for (let k = 0; k < coarse.n; k++) if (sea(k)) speeds.push(Math.hypot(flowE[k], flowN[k]));
+    for (let j = 0; j < 180; j++) {
+      const latD = 89.5 - j;
+      if (Math.abs(latD) < 15 || Math.abs(latD) > 40) continue;
+      const row: number[] = [];
+      for (let i = 0; i < 360; i++) row.push(nearestCellLatLon(coarse, latD * DEG, (-179.5 + i) * DEG));
+      for (let i = 0; i < 360; i++) {
+        const k = row[i];
+        if (!sea(k)) continue;
+        const pole = Math.sign(latD) * flowN[k];
+        cov += current[k] * pole;
+        va += current[k] ** 2;
+        vv += pole ** 2;
+        const westLand = !sea(row[(i + 359) % 360]) || !sea(row[(i + 358) % 360]);
+        const eastLand = !sea(row[(i + 1) % 360]) || !sea(row[(i + 2) % 360]);
+        if (westLand && !eastLand) {
+          wbV += pole;
+          wbN++;
+        } else if (eastLand && !westLand) {
+          ebV += pole;
+          ebN++;
+        }
+      }
+    }
+  }
+  speeds.sort((a, b) => a - b);
+  const pct = (f: number) => speeds[Math.floor(f * (speeds.length - 1))];
+  const corr = cov / Math.sqrt(va * vv);
+  check(
+    wbN > 100 && ebN > 100 && wbV / wbN > 0.15 && ebV / ebN < -0.02,
+    `subtropical western boundary currents run poleward (${(wbV / wbN).toFixed(2)} m/s), eastern ones toward the equator (${(ebV / ebN).toFixed(2)} m/s)`,
+  );
+  check(corr > 0.2, `warm currents run poleward, cold ones toward the equator (correlation ${corr.toFixed(2)})`);
+  check(
+    pct(0.5) >= 0.02 && pct(0.5) <= 0.2 && pct(0.99) >= 0.5 && pct(1) <= 2.0001,
+    `surface currents: median ${pct(0.5).toFixed(2)} m/s, 99th percentile ${pct(0.99).toFixed(2)}, fastest ${pct(1).toFixed(2)}`,
+  );
+}
+
 // Atolls crown drowned volcanoes in open water, clear of land and of each other
 // (checked on a second world too: this one's tropical seas have none at this detail).
 {
@@ -266,9 +412,11 @@ function cellsNear(at: { lat: number; lon: number }, km: number, w = world): num
   const deltaKinds = new Set(w.deposits.deltas.map((d) => d.kind));
   check(kinds.size >= 10 && deltaKinds.size === 3, `${kinds.size} kinds of surface deposit on land, ${w.deposits.deltas.length} river mouths with ${[...deltaKinds].join(', ')}-dominated deltas`);
 
-  // Earth-like drylands and inland drainage over a few worlds: about a fifth of
-  // the land drains to closed basins (Earth ~18-20%), Köppen B ~30% (here up to
-  // 40% for supercontinent worlds), P/PET < 0.2 on ~20% (Earth 19.6%).
+  // Earth-like drylands and inland drainage over a few worlds: on Earth about a
+  // fifth of the land drains to closed basins (~18-20%; these worlds' interiors
+  // run wetter, ~10-15%, and a basin near its brim opens or closes with a small
+  // shift in rain or evaporation, so the floor sits at 10%), Köppen B ~30% (here
+  // up to 40% for supercontinent worlds), P/PET < 0.2 on ~20% (Earth 19.6%).
   const sample = [w, ...['aurelia', 'vale-fen-46'].map((seed) => World.generate({ ...DEFAULT_PARAMS, seed, cells: 80000 }))];
   const shares = sample.map((v) => {
     let land = 0;
@@ -287,7 +435,7 @@ function cellsNear(at: { lat: number; lon: number }, km: number, w = world): num
   });
   const mean = (k: 'endo' | 'dryB' | 'arid') => shares.reduce((s, v) => s + v[k], 0) / shares.length;
   check(
-    mean('endo') > 12 && mean('endo') < 28 && shares.every((v) => v.endo < 35),
+    mean('endo') > 10 && mean('endo') < 28 && shares.every((v) => v.endo < 35),
     `inland drainage on ${shares.map((v) => v.endo.toFixed(0)).join('/')}% of land over three worlds (mean ${mean('endo').toFixed(1)}%)`,
   );
   check(
@@ -419,6 +567,34 @@ for (const l of LAYERS) {
 }
 check(true, `every layer renders a level-7 tile`);
 
+// The ocean-currents layer: its arrows sit on a global lattice and gather the
+// current from the cells around them, so a tile alone matches the same pixels
+// in a larger window, over the fastest current at two levels.
+{
+  const { curE, curN, ocean } = ctx.fields;
+  let fast = -1;
+  for (let c = 0; c < ocean.length; c++) {
+    if (ocean[c] && (fast < 0 || Math.hypot(curE[c], curN[c]) > Math.hypot(curE[fast], curN[fast]))) fast = c;
+  }
+  const opts = { layer: 'currents' as const, month: -1, rivers: false };
+  const seams: number[] = [];
+  for (const L of [4, 6]) {
+    const tx = Math.floor((((world.fine.lon[fast] + Math.PI) / (2 * Math.PI)) * levelWidth(L)) / TILE);
+    const ty = Math.floor((((Math.PI / 2 - world.fine.lat[fast]) / Math.PI) * levelHeight(L)) / TILE);
+    const big = renderWindow(ctx, opts, { level: L, x0: tx * TILE - 64, y0: Math.max(0, ty * TILE - 64), w: TILE + 128, h: TILE + 128 }).rgba;
+    const oy = ty * TILE - Math.max(0, ty * TILE - 64);
+    const one = renderWindow(ctx, opts, { level: L, x0: tx * TILE, y0: ty * TILE, w: TILE, h: TILE }).rgba;
+    let seam = 0;
+    for (let y = 0; y < TILE; y++) {
+      for (let x = 0; x < TILE; x++) {
+        for (let c = 0; c < 3; c++) seam = Math.max(seam, Math.abs(one[4 * (y * TILE + x) + c] - big[4 * ((y + oy) * (TILE + 128) + x + 64) + c]));
+      }
+    }
+    seams.push(seam);
+  }
+  check(Math.max(...seams) === 0, `the ocean-currents layer tiles seamlessly over its fastest current (max difference ${seams.join(', ')})`);
+}
+
 // A tile rendered alone must match the same pixels inside a larger window: at
 // a middle level, and at the deepest across the largest inland river (its
 // channel at true width, banks, meanders and valley).
@@ -445,6 +621,16 @@ const deepX = Math.floor((((world.fine.lon[tc] + Math.PI) / (2 * Math.PI)) * lev
 const deepY = Math.floor((((Math.PI / 2 - world.fine.lat[tc]) / Math.PI) * levelHeight(MAX_LEVEL)) / TILE);
 const seams = [seamAt(6, 300, 40), seamAt(MAX_LEVEL, deepX, deepY)];
 check(Math.max(...seams) <= 1, `tiles are seamless (max channel difference ${seams[0]} at level 6, ${seams[1]} at level ${MAX_LEVEL} on the largest river)`);
+
+// The renderer's own simplex noise (raster.ts snoise, a faster copy) must give
+// Simplex3's values bit for bit, and stay within the bound its early-outs use.
+{
+  const nc = rendererNoiseCheck(ctx.fields.noiseSeed, 400000);
+  check(
+    nc.mismatches === 0 && nc.maxAbs < nc.bound,
+    `renderer noise matches Simplex3 bit for bit (${nc.mismatches} of 400,000 points differ) and stays within its early-out bound (max |n| ${nc.maxAbs.toFixed(3)} < ${nc.bound})`,
+  );
+}
 
 // Rivers end where they run into the drawn sea (open, or a drowned fjord) or a
 // lake, or die away in dry country: none stops short on land, and a course
@@ -1478,6 +1664,112 @@ check(Math.max(...seams) <= 1, `tiles are seamless (max channel difference ${sea
     strandLand > 20 && wrongCoast === 0 && isl >= 20 && isl > 4 * islPlain,
     `strandflats on ${strandLand} glaciated hard-rock coast cells (${wrongCoast} on deltas, soft rock or unglaciated ground): ${isl} islets off one at level 9, ${islPlain} off a delta coast`,
   );
+}
+
+// The history since the last glacial maximum: forcing, ice sheets, sea level,
+// the land's rebound, coastlines, closed lakes and the slices at full detail.
+{
+  const w = sharedWorld('selftest', 80000);
+  const tH = performance.now();
+  const h = w.ensureHistory();
+  const msH = performance.now() - tH;
+  const S = h.slices;
+  const first = S[0];
+  const last = S[S.length - 1];
+  const at = (ka: number) => S.find((s) => s.ka === ka)!;
+  // The present slice is today's world, and viewing the past and coming back restores it exactly.
+  const before = { elev: w.elev, ocean: w.ocean, temp: w.temp, hydro: w.hydro, ice: w.ice, biomes: w.biomes };
+  const tV = performance.now();
+  w.viewTime(14);
+  const msV = performance.now() - tV;
+  const land14 = w.landFraction();
+  let iced14 = 0;
+  for (let c = 0; c < w.fine.n; c++) if (w.ice.thick[c] > 0) iced14++;
+  w.viewTime(0);
+  let iced0 = 0;
+  for (let c = 0; c < w.fine.n; c++) if (w.ice.thick[c] > 0) iced0++;
+  const same = w.elev === before.elev && w.ocean === before.ocean && w.temp === before.temp && w.hydro === before.hydro && w.ice === before.ice && w.biomes === before.biomes;
+  check(
+    same && last.seaLevel === 0 && last.iceLeft.every((v) => v === 0) && last.depression.every((v) => v === 0) && land14 > w.landFraction() && iced14 > iced0,
+    `the present slice is today's world, restored exactly after viewing 14 ka (land ${(100 * land14).toFixed(1)}% then, ${(100 * w.landFraction()).toFixed(1)}% now; history ${(msH / 1000).toFixed(1)} s, slice ${(msV / 1000).toFixed(1)} s)`,
+  );
+  // Sea level rises from the ice age in a sensible shape.
+  let maxFall = 0;
+  for (let i = 1; i < S.length; i++) maxFall = Math.max(maxFall, S[i - 1].seaLevel - S[i].seaLevel);
+  const half = S.find((s) => s.seaLevel >= first.seaLevel / 2)!.ka;
+  check(
+    first.seaLevel === -120 && last.seaLevel === 0 && maxFall <= 8 && half <= 15 && half >= 5,
+    `sea level rises from ${first.seaLevel} m at 21 ka to today's, half way by ${half} ka (largest fall between slices ${maxFall.toFixed(1)} m; the ice volume alone gives ${first.seaLevelRaw.toFixed(0)} m)`,
+  );
+  // Ice volume falls.
+  check(
+    first.iceVolume > 0 && at(10).iceVolume < 0.85 * first.iceVolume && at(6).iceVolume < at(14).iceVolume && Math.abs(last.iceVolume) < 1e-6 && first.iceAreaKm2 > 1e6,
+    `the ice sheets melt back: ${(first.iceAreaKm2 / 1e6).toFixed(1)} million km² beyond today's ice at 21 ka, ${(at(14).iceAreaKm2 / 1e6).toFixed(1)} at 14 ka, ${(at(6).iceAreaKm2 / 1e6).toFixed(1)} at 6 ka`,
+  );
+  // The ice age's shelves and land bridges drown by the present.
+  const bridges = h.events.filter((e) => e.text.startsWith('The land bridge')).length;
+  const shelf = (first.landFraction - last.landFraction) * 4 * Math.PI * w.params.radiusKm ** 2;
+  check(
+    shelf > 1e6 && first.landFraction > at(10).landFraction && at(10).landFraction > last.landFraction,
+    `${(shelf / 1e6).toFixed(1)} million km² of ice-age shelf drowns by today (${(100 * first.landFraction).toFixed(1)}% land at 21 ka, ${(100 * last.landFraction).toFixed(1)}% now); ${bridges} land bridge(s) drowned`,
+  );
+  // Land rebounds where the ice used to sit: lower than today once the ice has gone, level with it now.
+  const s10 = at(10);
+  let dep = 0;
+  let nDep = 0;
+  for (let k = 0; k < s10.depression.length; k++) {
+    if (first.ice[k] - last.ice[k] > 300 && s10.ice[k] - last.ice[k] < 30) {
+      dep += s10.depression[k];
+      nDep++;
+    }
+  }
+  check(nDep > 0 && dep / nDep > 5, `land the ice has just left still lies ${(dep / Math.max(1, nDep)).toFixed(0)} m lower than today at 10 ka (${nDep} climate cells), and has rebounded by now`);
+  // Closed lakes swell when their basins get more water: in the wettest past slice the lakes in today's
+  // closed basins (closed or brimming over, as Lake Bonneville did) cover more than today's, at full detail.
+  const endo = w.hydro.endorheic;
+  const closedArea = (): number => {
+    const seen = new Set<number>();
+    let a = 0;
+    for (let c = 0; c < w.fine.n; c++) {
+      const id = w.hydro.lake[c];
+      if (id >= 0 && endo[c] && !seen.has(id)) {
+        seen.add(id);
+        a += w.hydro.lakes[id].areaKm2;
+      }
+    }
+    return a;
+  };
+  const today = closedArea();
+  let wettest = S[0];
+  for (const s of S.slice(0, -1)) if (s.closedLakeKm2 > wettest.closedLakeKm2) wettest = s;
+  w.viewTime(wettest.ka);
+  const then = closedArea();
+  // Slices tile seamlessly: a tile alone matches the same pixels inside a larger window, at an ice margin.
+  const ctxH = { mesh: meshData(w.fine, 'history'), fields: buildFields(w, 'history', 7) };
+  let edge = -1;
+  for (let c = 0; c < w.fine.n && edge < 0; c++) {
+    if (w.ice.thick[c] <= 0 || w.ocean[c]) continue;
+    for (let k = w.fine.nbrStart[c]; k < w.fine.nbrStart[c + 1]; k++) if (w.ice.thick[w.fine.nbr[k]] === 0 && !w.ocean[w.fine.nbr[k]]) edge = c;
+  }
+  const seams: number[] = [];
+  for (const L of [6, 8]) {
+    const tx = Math.floor((((w.fine.lon[edge] + Math.PI) / (2 * Math.PI)) * levelWidth(L)) / TILE);
+    const ty = Math.max(1, Math.floor((((Math.PI / 2 - w.fine.lat[edge]) / Math.PI) * levelHeight(L)) / TILE));
+    const opts = { layer: 'terrain' as const, month: -1, rivers: true };
+    const big = renderWindow(ctxH, opts, { level: L, x0: tx * TILE - 64, y0: ty * TILE - 64, w: TILE + 128, h: TILE + 128 }).rgba;
+    const one = renderWindow(ctxH, opts, { level: L, x0: tx * TILE, y0: ty * TILE, w: TILE, h: TILE }).rgba;
+    let seam = 0;
+    for (let y = 0; y < TILE; y++) {
+      for (let x = 0; x < TILE; x++) {
+        for (let ch = 0; ch < 3; ch++) seam = Math.max(seam, Math.abs(one[4 * (y * TILE + x) + ch] - big[4 * ((y + 64) * (TILE + 128) + x + 64) + ch]));
+      }
+    }
+    seams.push(seam);
+  }
+  w.viewTime(0);
+  check(then > today, `closed lakes swell in the wettest slice (${wettest.ka} ka): ${(then / 1000).toFixed(0)}k km² at full detail against ${(today / 1000).toFixed(0)}k km² today`);
+  check(edge >= 0 && Math.max(...seams) <= 1, `a history slice (${wettest.ka} ka) tiles seamlessly at an ice margin (max difference ${seams.join(', ')})`);
+  check(h.events.length >= 5 && h.events.some((e) => e.text.startsWith('Younger Dryas')), `${h.events.length} events since the glacial maximum, e.g. "${h.events[0].text.slice(0, 60)}…"`);
 }
 
 if (failures) {

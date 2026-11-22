@@ -5,6 +5,7 @@ import { type Channels, computeChannels } from './channels';
 import { type Climate, computeClimate, LAPSE, MONTHS } from './climate';
 import { computeLithology, type Lithology, ROCK_NAMES } from './geology';
 import { glacialErosion, ICE_AGE_SEA_LEVEL, ICE_ISOSTASY, iceAgeCooling, type IceSheet, simulateIce } from './glaciers';
+import { buildHistory, type History, sampleCoarse, sliceClimate } from './history';
 import { computeHydrology, type Hydrology, oceanMask, slopeScale } from './hydrology';
 import { aeolianDeposits, type Deposits, erode, type ErosionResult, finalizeDeposits, glacialDeposits, rockTraits } from './sediment';
 import { computeRelief, type Relief, seaLevelForLandFraction } from './relief';
@@ -17,6 +18,27 @@ import { Geology, type Hotspot, type Plate, type WorldParams } from './types';
 import { computeWaterBalance, type WaterBalance } from './waterBalance';
 
 export type Progress = (stage: string, frac: number) => void;
+
+/** The fields a history slice replaces while it is on show. */
+interface ViewState {
+  elev: Float32Array;
+  ocean: Uint8Array;
+  temp: Float32Array;
+  precip: Float32Array;
+  precipYear: Float32Array;
+  petYear: Float32Array;
+  maritime: Float32Array;
+  water: WaterBalance;
+  hydro: Hydrology;
+  biomes: BiomeResult;
+  channels: Channels;
+  ice: IceSheet;
+  climate: Climate;
+  currentE: Float32Array;
+  currentN: Float32Array;
+  currentAnom: Float32Array;
+  slope: Float32Array;
+}
 
 /** Which part of the pipeline must be recomputed. */
 export type DeriveFrom = 'tectonics' | 'relief' | 'climate';
@@ -76,6 +98,14 @@ export class World {
   petYear!: Float32Array;
   /** Downwind maritime influence (1 at sea, decaying inland). */
   maritime!: Float32Array;
+  /**
+   * Surface ocean current per cell (m/s eastward and northward) and the sea's
+   * temperature anomaly it carries (°C), interpolated from the ocean cells of
+   * the climate mesh (zero over land away from the coast).
+   */
+  currentE!: Float32Array;
+  currentN!: Float32Array;
+  currentAnom!: Float32Array;
   /** Monthly land-surface water balance: evaporation, snow, soil, runoff. */
   water!: WaterBalance;
   /** Sediment laid down by rivers (m): silted-up basins, floodplains, shelves and deltas. */
@@ -98,6 +128,13 @@ export class World {
   channels!: Channels;
   slope!: Float32Array;
   timings: Record<string, number> = {};
+  /** The world from the last glacial maximum to today (null until built, or after an edit). */
+  history: History | null = null;
+  /** The time on show (ka, thousands of years ago; 0 = today). */
+  timeKa = 0;
+  /** Today's fields while a past slice is on show, and the slices built at full detail. */
+  private presentView: ViewState | null = null;
+  private viewCache = new Map<number, ViewState>();
 
   undoStack: EditRecord[] = [];
   redoStack: EditRecord[] = [];
@@ -118,6 +155,9 @@ export class World {
     const coarse = buildSphereMesh(coarseCellsFor(params.cells), seedFor(params.seed, 'coarse-mesh'));
     return { fine, coarse };
   }
+
+  /** Build the history since the last ice age with every new world (scripts that don't need it switch it off). */
+  static historyOnGenerate = true;
 
   static generate(params: WorldParams, progress: Progress = () => {}): World {
     const t0 = performance.now();
@@ -148,7 +188,8 @@ export class World {
     world.historyLog = log;
     world.timings.mesh = tMesh - t0;
     world.timings.history = tSim - tMesh;
-    world.derive('tectonics', (s, f) => progress(s, 0.55 + 0.45 * f));
+    world.derive('tectonics', (s, f) => progress(s, 0.55 + 0.35 * f));
+    if (World.historyOnGenerate) world.ensureHistory((s, f) => progress(s, 0.9 + 0.1 * f));
     world.timings.total = performance.now() - t0;
     return world;
   }
@@ -158,12 +199,19 @@ export class World {
     const { fine, coarse } = World.buildMeshes(params);
     if (geo.n !== fine.n) throw new Error(`Saved world has ${geo.n} cells; mesh has ${fine.n}`);
     const world = new World(params, fine, coarse, geo);
-    world.derive('tectonics', progress);
+    world.derive('tectonics', (s, f) => progress(s, 0.9 * f));
+    if (World.historyOnGenerate) world.ensureHistory((s, f) => progress(s, 0.9 + 0.1 * f));
     return world;
   }
 
   /** Recompute every layer that depends on the geology (or climate parameters). */
   derive(from: DeriveFrom, progress: Progress = () => {}): void {
+    // Whatever slice was on show, the world is re-derived as it is today.
+    if (this.presentView) this.assignView(this.presentView);
+    this.presentView = null;
+    this.viewCache.clear();
+    this.timeKa = 0;
+    this.history = null;
     const { fine, params } = this;
     const R = params.radiusKm;
     const T = (k: string, t: number) => (this.timings[k] = performance.now() - t);
@@ -193,31 +241,10 @@ export class World {
 
     // Interpolate climate onto the fine mesh.
     const n = fine.n;
-    const tempSL = new Float32Array(n * MONTHS);
-    const precip = new Float32Array(n * MONTHS);
-    const maritime = new Float32Array(n);
-    const { idx, w } = this.f2c;
-    const cT = this.climate.tempSL;
-    const cP = this.climate.precip;
-    const cM = this.climate.maritime;
-    for (let c = 0; c < n; c++) {
-      const ia = idx[3 * c];
-      const ib = idx[3 * c + 1];
-      const id = idx[3 * c + 2];
-      const a = ia * MONTHS;
-      const b = ib * MONTHS;
-      const d = id * MONTHS;
-      const wa = w[3 * c];
-      const wb = w[3 * c + 1];
-      const wd = w[3 * c + 2];
-      for (let m = 0; m < MONTHS; m++) {
-        tempSL[c * MONTHS + m] = cT[a + m] * wa + cT[b + m] * wb + cT[d + m] * wd;
-        precip[c * MONTHS + m] = cP[a + m] * wa + cP[b + m] * wb + cP[d + m] * wd;
-      }
-      maritime[c] = Math.min(1, cM[ia] * wa + cM[ib] * wb + cM[id] * wd);
-    }
+    const { tempSL, precip, maritime, drift } = this.fineClimate(this.climate);
     this.precip = precip;
     this.maritime = maritime;
+    this.interpolateCurrents(landC);
     this.precipYear = new Float32Array(n);
     for (let c = 0; c < n; c++) {
       let s = 0;
@@ -253,7 +280,10 @@ export class World {
     // troughs and fjords and scoured the lowlands; today's ice sits on that bed.
     t = performance.now();
     progress('Ice ages and glaciers', 0.72);
-    const iceAgeClimate = { tempSL, precip, cool: iceAgeCooling(fine), precipFactor: 0.8 };
+    // The subpolar warm drift faltered in the ice age: its warmth goes too.
+    const cool = iceAgeCooling(fine);
+    for (let c = 0; c < n; c++) cool[c] += drift[c];
+    const iceAgeClimate = { tempSL, precip, cool, precipFactor: 0.8 };
     const past = simulateIce(fine, bed, oceanMask(fine, bed), iceAgeClimate, ICE_AGE_SEA_LEVEL, R, false);
     const legacy = glacialErosion(fine, bed, past, iceAgeClimate, R);
     this.iceAge = { thick: past.thick, ...legacy };
@@ -354,6 +384,222 @@ export class World {
     this.ocean = oceanMask(this.fine, this.elev);
   }
 
+  /** A climate-mesh climate on the fine mesh: monthly sea-level air and rain, maritime influence, the warm drift's warmth. */
+  private fineClimate(cl: Climate): { tempSL: Float32Array; precip: Float32Array; maritime: Float32Array; drift: Float32Array } {
+    const n = this.fine.n;
+    const tempSL = new Float32Array(n * MONTHS);
+    const precip = new Float32Array(n * MONTHS);
+    const maritime = new Float32Array(n);
+    const drift = new Float32Array(n);
+    const { idx, w } = this.f2c;
+    const cT = cl.tempSL;
+    const cP = cl.precip;
+    const cM = cl.maritime;
+    const cD = cl.drift;
+    for (let c = 0; c < n; c++) {
+      const ia = idx[3 * c];
+      const ib = idx[3 * c + 1];
+      const id = idx[3 * c + 2];
+      const a = ia * MONTHS;
+      const b = ib * MONTHS;
+      const d = id * MONTHS;
+      const wa = w[3 * c];
+      const wb = w[3 * c + 1];
+      const wd = w[3 * c + 2];
+      for (let m = 0; m < MONTHS; m++) {
+        tempSL[c * MONTHS + m] = cT[a + m] * wa + cT[b + m] * wb + cT[d + m] * wd;
+        precip[c * MONTHS + m] = cP[a + m] * wa + cP[b + m] * wb + cP[d + m] * wd;
+      }
+      maritime[c] = Math.min(1, cM[ia] * wa + cM[ib] * wb + cM[id] * wd);
+      drift[c] = cD[ia] * wa + cD[ib] * wb + cD[id] * wd;
+    }
+    return { tempSL, precip, maritime, drift };
+  }
+
+  // ---------------------------------------------------------------- history
+
+  /** Build the history (ice age to today) if it isn't there, from today's world. */
+  ensureHistory(progress: Progress = () => {}): History {
+    if (!this.history) {
+      if (this.presentView) this.assignView(this.presentView);
+      const t = performance.now();
+      this.history = buildHistory(this, progress);
+      this.timings.deglaciation = performance.now() - t;
+      if (this.presentView) {
+        const v = this.viewCache.get(this.timeKa);
+        if (v) this.assignView(v);
+      }
+    }
+    return this.history;
+  }
+
+  /** Show the world as it was `ka` thousand years ago (one of the history's slices; 0 = today). */
+  viewTime(ka: number, progress: Progress = () => {}): void {
+    if (ka === this.timeKa) return;
+    if (!this.presentView) this.presentView = this.captureView();
+    this.assignView(this.presentView);
+    this.timeKa = 0;
+    if (ka === 0) return;
+    const h = this.ensureHistory(progress);
+    if (!h.slices.some((s) => s.ka === ka)) throw new Error(`No history slice at ${ka} ka`);
+    let v = this.viewCache.get(ka);
+    if (!v) {
+      v = this.buildView(ka, progress);
+      // Keep the last few slices at full detail (one at the finest meshes: a slice's monthly fields run to hundreds of MB).
+      const keep = this.fine.n > 600000 ? 1 : 3;
+      while (this.viewCache.size >= keep) this.viewCache.delete(this.viewCache.keys().next().value!);
+      this.viewCache.set(ka, v);
+    }
+    this.assignView(v);
+    this.timeKa = ka;
+  }
+
+  private captureView(): ViewState {
+    return {
+      elev: this.elev, ocean: this.ocean, temp: this.temp, precip: this.precip, precipYear: this.precipYear, petYear: this.petYear,
+      maritime: this.maritime, water: this.water, hydro: this.hydro, biomes: this.biomes, channels: this.channels, ice: this.ice,
+      climate: this.climate, currentE: this.currentE, currentN: this.currentN, currentAnom: this.currentAnom, slope: this.slope,
+    };
+  }
+
+  private assignView(v: ViewState): void {
+    this.elev = v.elev;
+    this.ocean = v.ocean;
+    this.temp = v.temp;
+    this.precip = v.precip;
+    this.precipYear = v.precipYear;
+    this.petYear = v.petYear;
+    this.maritime = v.maritime;
+    this.water = v.water;
+    this.hydro = v.hydro;
+    this.biomes = v.biomes;
+    this.channels = v.channels;
+    this.ice = v.ice;
+    this.climate = v.climate;
+    this.currentE = v.currentE;
+    this.currentN = v.currentN;
+    this.currentAnom = v.currentAnom;
+    this.slope = v.slope;
+  }
+
+  /**
+   * A history slice at full detail, from today's fields (on show while it is
+   * built): the ice age's ice where the slice keeps it (thinning toward its
+   * retreating margins), the land still pressed down where ice was, the
+   * slice's sea level as the new zero, and the slice's climate, rivers,
+   * lakes (ice-dammed ones too) and vegetation.
+   */
+  private buildView(ka: number, progress: Progress): ViewState {
+    const h = this.history!;
+    const s = h.slices.find((x) => x.ka === ka)!;
+    const { fine, params } = this;
+    const n = fine.n;
+    const R = params.radiusKm;
+    const past = this.iceAge.thick;
+    const pres = this.ice;
+    const bed = this.bed;
+    progress(`${ka} ka: ice and coastlines`, 0.1);
+    const thick = new Float32Array(n);
+    const cover = new Float32Array(n);
+    const elev = new Float32Array(n);
+    for (let c = 0; c < n; c++) {
+      const dep = sampleCoarse(this, s.depression, c);
+      let t = pres.thick[c];
+      const extra = past[c] - pres.thick[c];
+      if (extra > 0) {
+        const left = sampleCoarse(this, s.iceLeft, c);
+        const add = extra * Math.sqrt(Math.max(0, left));
+        if (add > 40) t += add;
+      }
+      // Ice whose ground the sea has drowned floats off and breaks up.
+      const ground = bed[c] - dep - s.seaLevel;
+      if (t > pres.thick[c] && ground < 0 && 0.917 * t < -ground) t = pres.thick[c];
+      thick[c] = t;
+      cover[c] = t > pres.thick[c] ? 1 : pres.cover[c];
+      elev[c] = bed[c] + (1 - ICE_ISOSTASY) * t - dep - s.seaLevel;
+    }
+    const ocean = oceanMask(fine, elev);
+    const shelf = new Uint8Array(n);
+    for (let c = 0; c < n; c++) shelf[c] = pres.shelf[c] && ocean[c] ? 1 : 0;
+    const body = new Int32Array(n);
+    {
+      const stack: number[] = [];
+      const seen = new Uint8Array(n);
+      for (let c0 = 0; c0 < n; c0++) {
+        if (seen[c0] || thick[c0] <= 0) continue;
+        const members: number[] = [];
+        seen[c0] = 1;
+        stack.push(c0);
+        while (stack.length) {
+          const c = stack.pop()!;
+          members.push(c);
+          for (let k = fine.nbrStart[c], e = fine.nbrStart[c + 1]; k < e; k++) {
+            const m = fine.nbr[k];
+            if (!seen[m] && thick[m] > 0) {
+              seen[m] = 1;
+              stack.push(m);
+            }
+          }
+        }
+        for (const c of members) body[c] = members.length;
+      }
+    }
+    const smb = new Float32Array(n);
+    for (let c = 0; c < n; c++) smb[c] = thick[c] > pres.thick[c] + 1 ? 0 : pres.smb[c];
+    const ice: IceSheet = { thick, cover, smb, flux: new Float32Array(n), receiver: new Int32Array(n).fill(-1), shelf, body, calving: 0 };
+
+    progress(`${ka} ka: climate`, 0.25);
+    const cl = sliceClimate(h, s);
+    const { tempSL, precip, maritime } = this.fineClimate(cl);
+    const temp = this.surfaceTemperature(tempSL, elev, ocean);
+    const precipYear = new Float32Array(n);
+    for (let c = 0; c < n; c++) {
+      let sum = 0;
+      for (let m = 0; m < MONTHS; m++) sum += precip[c * MONTHS + m];
+      precipYear[c] = sum;
+    }
+    const slope = this.computeSlope(elev);
+    progress(`${ka} ka: rivers and lakes`, 0.4);
+    const water = computeWaterBalance(fine, temp, precip, ocean, slope, maritime, params.axialTiltDeg + s.forcing.orbit.dTiltDeg, cover);
+    const hydro = computeHydrology(fine, elev, ocean, water, precip, temp, slope, this.relief.rough, R, undefined, false, undefined, { iceDammedLakes: true });
+    progress(`${ka} ka: vegetation and channels`, 0.75);
+    const biomes = computeBiomes(fine, elev, temp, precip, ocean, hydro, water);
+    // Today's deltas grew at today's coasts, after the seas stopped rising.
+    const deposits = Math.abs(s.seaLevel) > 2 ? { ...this.deposits, deltas: [] } : this.deposits;
+    const lith = this.lithology;
+    const channels = computeChannels(fine, {
+      radiusKm: R,
+      seed: params.seed,
+      elev,
+      ocean,
+      hydro,
+      deposits,
+      erodibility: lith.erodibility,
+      sandyRock: rockTraits(lith.rock, ROCK_NAMES).sandy,
+      biome: biomes.biome,
+      temp,
+      precipYear,
+      petYear: water.petYear,
+      rough: this.relief.rough,
+      iceCover: cover,
+      iceAgeErosion: this.iceAge.erosion,
+      minDischarge: 1,
+    });
+    // The slice's ocean currents, over its own coastlines.
+    const saved = { climate: this.climate, e: this.currentE, nn: this.currentN, a: this.currentAnom };
+    this.climate = cl;
+    this.interpolateCurrents(s.land);
+    const currents = { e: this.currentE, nn: this.currentN, a: this.currentAnom };
+    this.climate = saved.climate;
+    this.currentE = saved.e;
+    this.currentN = saved.nn;
+    this.currentAnom = saved.a;
+    return {
+      elev, ocean, temp, precip, precipYear, petYear: water.petYear, maritime, water, hydro, biomes, channels, ice,
+      climate: cl, currentE: currents.e, currentN: currents.nn, currentAnom: currents.a, slope,
+    };
+  }
+
   private aggregateToCoarse(elev: Float32Array, ocean: Uint8Array): { elevC: Float32Array; landC: Float32Array } {
     const { fine, coarse } = this;
     const sumA = new Float64Array(coarse.n);
@@ -380,6 +626,50 @@ export class World {
       }
     }
     return { elevC, landC };
+  }
+
+  /**
+   * The climate mesh's ocean currents onto the fine mesh, from the ocean
+   * corners of each cell's climate triangle only (the land corners carry no
+   * anomaly), falling back to all corners where the triangle has no sea.
+   */
+  private interpolateCurrents(landC: Float32Array): void {
+    const n = this.fine.n;
+    const { idx, w } = this.f2c;
+    const { flowE, flowN, current } = this.climate;
+    const e = new Float32Array(n);
+    const nn = new Float32Array(n);
+    const a = new Float32Array(n);
+    for (let c = 0; c < n; c++) {
+      let se = 0;
+      let sn = 0;
+      let sa = 0;
+      let sw = 0;
+      for (let k = 0; k < 3; k++) {
+        const q = idx[3 * c + k];
+        if (landC[q] > 0.5) continue;
+        const wt = w[3 * c + k];
+        se += wt * flowE[q];
+        sn += wt * flowN[q];
+        sa += wt * current[q];
+        sw += wt;
+      }
+      if (sw > 1e-6) {
+        e[c] = se / sw;
+        nn[c] = sn / sw;
+        a[c] = sa / sw;
+        continue;
+      }
+      for (let k = 0; k < 3; k++) {
+        const q = idx[3 * c + k];
+        const wt = w[3 * c + k];
+        e[c] += wt * flowE[q];
+        nn[c] += wt * flowN[q];
+      }
+    }
+    this.currentE = e;
+    this.currentN = nn;
+    this.currentAnom = a;
   }
 
   private surfaceTemperature(tempSL: Float32Array, elev: Float32Array, ocean: Uint8Array): Float32Array {

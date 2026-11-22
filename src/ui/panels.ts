@@ -106,6 +106,11 @@ export function legendHtml(layer: LayerId, summary: WorldSummary | null): string
         gradientBar(pal.FERTILITY, (v) => v.toFixed(2).replace(/0+$/, '').replace(/\.$/, ''), [0, 0.25, 0.5, 0.75, 1]) +
         '<p class="muted">Farming fertility, 0–1. High on volcanic ash, loess, fresh river silt, limestone and basalt, and on grassland black earths; low on old leached tropical soils, podzols, desert, frozen and salty soils, and wherever the ground is thin, steep or waterlogged.</p>'
       );
+    case 'currents':
+      return (
+        gradientBar(pal.CURRENT_ANOM, (v) => `${v > 0 ? '+' : ''}${v}°`, [-8, -4, 0, 4, 8]) +
+        '<p class="muted">Surface ocean currents driven by the winds. Arrows show the flow, longer and bolder where it runs faster: 1–2 m/s in the boundary currents, a tenth of a metre a second or less across the open gyres. The sea is coloured by how much warmer (red) or colder (blue) its current keeps it than is usual for the latitude. In the subtropics warm currents run poleward along the western sides of the oceans; cold ones run toward the equator along the eastern sides, where the trade winds draw cold water up from below (upwelling). Westerly drifts carry warm water toward the eastern sides of the subpolar oceans.</p>'
+      );
     case 'drainage':
       return '<p class="muted">Each color is one drainage basin: all land whose water leaves through the same river mouth or ends in the same inland lake or salt flat. Blue lines are rivers above the discharge threshold; dashed ones run only part of the year. Arrows point the way the water flows.</p>';
     case 'channels':
@@ -161,12 +166,14 @@ export function inspectorHtml(info: InspectInfo | null): string {
   const ew = info.lon >= 0 ? 'E' : 'W';
   const elev = info.water === 'ocean' ? `${Math.round(-info.elevation).toLocaleString('en-US')} m deep` : `${Math.round(info.elevation).toLocaleString('en-US')} m`;
   const rows: [string, string][] = [
+    ...(info.era ? ([['When', info.era]] as [string, string][]) : []),
     ['Location', `${Math.abs(info.lat).toFixed(1)}°${ns}, ${Math.abs(info.lon).toFixed(1)}°${ew}`],
     [info.water === 'ocean' ? 'Depth' : 'Elevation', elev + (info.water && info.water !== 'ocean' ? ` (${info.water})` : '')],
     ['Setting', info.setting],
     ['Plate', `${info.plate.name} · ${info.plate.speed.toFixed(1)} cm/yr → ${info.plate.dir}`],
     ['Crust', `${info.crust.continental ? 'Continental' : 'Oceanic'}, ${info.crust.thickness.toFixed(0)} km${info.crust.continental ? '' : `, ${info.crust.age.toFixed(0)} Myr old`}`],
   ];
+  if (info.current) rows.push(['Current', info.current]);
   if (info.soil) rows.push(['Soil', info.soil]);
   if (info.surface) rows.push(['Surface', info.surface]);
   if (info.bedrock) rows.push(['Bedrock', info.bedrock]);

@@ -8,6 +8,7 @@ import { BASE_LEVEL, levelForWidth, levelHeight, levelWidth, type PixelWindow, t
 import { BIOME_INFO, KOPPEN_CODES, KOPPEN_NAMES } from '../world/biomes';
 import { Channel, type DeltaForm, type Distributaries } from '../world/channels';
 import { MONTHS } from '../world/climate';
+import { SLICE_KA } from '../world/history';
 import * as edits from '../world/edits';
 import { ROCK_INFO } from '../world/geology';
 import { LakeKind } from '../world/hydrology';
@@ -148,7 +149,39 @@ function summary(w: World): WorldSummary {
     undoLabel: undo?.label,
     redoLabel: redo?.label,
     timings: w.timings,
+    timeKa: w.timeKa,
+    history: historySummary(w),
   };
+}
+
+function historySummary(w: World): WorldSummary['history'] {
+  const h = w.history;
+  if (!h) return { slices: SLICE_KA.map((ka) => ({ ka, seaLevel: 0, iceAreaKm2: 0, landFraction: 0, dT: 0, co2: 0, drift: 0, july65N: 0 })), events: [], built: false };
+  return {
+    slices: h.slices.map((s) => ({
+      ka: s.ka,
+      seaLevel: s.seaLevel,
+      iceAreaKm2: s.iceAreaKm2,
+      landFraction: s.landFraction,
+      dT: s.dT,
+      co2: s.forcing.co2,
+      drift: s.forcing.drift,
+      july65N: s.forcing.july65N,
+    })),
+    events: h.events,
+    built: true,
+  };
+}
+
+/** The past time on show, for the inspector. */
+function describeEra(w: World): string | null {
+  if (w.timeKa === 0 || !w.history) return null;
+  const s = w.history.slices.find((x) => x.ka === w.timeKa);
+  if (!s) return null;
+  const years = Math.round(w.timeKa * 1000).toLocaleString('en-US');
+  const sea = Math.round(-s.seaLevel);
+  const air = s.dT <= -0.05 ? `, the air ${(-s.dT).toFixed(1)} °C colder on average` : '';
+  return `${years} years ago: seas ${sea} m lower than today's${air}; CO₂ ${Math.round(s.forcing.co2)} ppm`;
 }
 
 function describeSetting(w: World, c: number): { setting: string; boundary: string | null } {
@@ -460,6 +493,7 @@ function inspect(w: World, lat: number, lon: number): InspectInfo {
   return {
     lat,
     lon,
+    era: describeEra(w),
     elevation: built ? Math.round(0.5 + 1.8 * (1 - built.rho) ** 2) : w.elev[c],
     water,
     plate: { id: g.plate[c], name: g.plates[g.plate[c]].name, speed, dir },
@@ -487,7 +521,23 @@ function inspect(w: World, lat: number, lon: number): InspectInfo {
     endorheic: h.endorheic[c] === 1,
     ice: describeIce(w, c),
     iceAge: describeIceAge(w, c),
+    current: water === 'ocean' ? describeCurrent(w, c) : null,
   };
+}
+
+/** The surface current at an ocean cell: kind, heading, speed and the warmth or chill it carries. */
+function describeCurrent(w: World, c: number): string | null {
+  const vE = w.currentE[c];
+  const vN = w.currentN[c];
+  const sp = Math.hypot(vE, vN);
+  if (sp < 0.005) return null;
+  const a = w.currentAnom[c];
+  const up = w.climate.upwell[w.f2c.nearest[c]] ?? 0;
+  const kind = a <= -1 ? (up > 0.25 ? 'Cold upwelling current' : 'Cold current') : a >= 1 ? 'Warm current' : sp < 0.1 ? 'Slow drift' : 'Current';
+  const dir = compassName((Math.atan2(vE, vN) / DEG + 360) % 360);
+  const speed = sp >= 0.1 ? sp.toFixed(1) : sp.toFixed(2);
+  const anom = Math.abs(a) >= 0.5 ? `, keeping the sea ${Math.abs(a).toFixed(1)} °C ${a > 0 ? 'warmer' : 'colder'} than usual for the latitude` : '';
+  return `${kind} flowing ${dir} at ${speed} m/s${anom}`;
 }
 
 function describeIce(w: World, c: number): string | null {
@@ -497,6 +547,10 @@ function describeIce(w: World, c: number): string | null {
   if (H <= 0) return null;
   const km2 = Math.round((ice.body[c] * 4 * Math.PI * w.params.radiusKm ** 2) / w.fine.n / 1000) * 1000;
   const kind = ice.body[c] >= 40 ? 'Ice sheet' : ice.body[c] >= 3 ? 'Ice cap' : 'Glacier';
+  // Ice of a past slice beyond today's: what is left of the ice age's sheets.
+  if (w.timeKa > 0 && ice.smb[c] === 0) {
+    return `${kind} (~${km2.toLocaleString('en-US')} km²) of the waning ice age, ${Math.round(H).toLocaleString('en-US')} m thick here`;
+  }
   const smb = ice.smb[c] * 1000;
   const zone = smb >= 0 ? `accumulation zone, keeping ${Math.round(smb)} mm of water a year as new ice` : `melt zone, losing ${Math.round(-smb)} mm a year that flowing ice replaces`;
   const f = ice.cover[c];
@@ -652,6 +706,7 @@ async function handle(msg: Request): Promise<void> {
     case 'stroke': {
       const w = requireWorld();
       if (msg.phase === 'start') {
+        w.viewTime(0);
         w.beginEdit();
         strokeTool = msg.tool;
         strokeReport = null;
@@ -676,6 +731,7 @@ async function handle(msg: Request): Promise<void> {
     }
     case 'edit': {
       const w = requireWorld();
+      w.viewTime(0);
       w.beginEdit();
       const report = applyOp(w, msg.op);
       if (report.failed) {
@@ -692,6 +748,7 @@ async function handle(msg: Request): Promise<void> {
     case 'undo':
     case 'redo': {
       const w = requireWorld();
+      w.viewTime(0);
       const rec = msg.type === 'undo' ? w.undo() : w.redo();
       if (rec) {
         progress(`${msg.type === 'undo' ? 'Undoing' : 'Redoing'} ${rec.label}`, 0);
@@ -702,6 +759,7 @@ async function handle(msg: Request): Promise<void> {
     }
     case 'setParams': {
       const w = requireWorld();
+      w.viewTime(0);
       const from = deriveFor(msg.params);
       w.beginEdit();
       w.params = { ...w.params, ...msg.params };
@@ -712,6 +770,7 @@ async function handle(msg: Request): Promise<void> {
     }
     case 'fitSeaLevel': {
       const w = requireWorld();
+      w.viewTime(0);
       w.beginEdit();
       w.params = { ...w.params, seaLevel: Math.round(w.seaLevelFor(msg.landFraction)) };
       w.derive('relief', progress);
@@ -736,6 +795,18 @@ async function handle(msg: Request): Promise<void> {
     case 'export':
       await exportFile(requireWorld(), msg.what, msg.render, msg.width);
       break;
+    case 'setTime': {
+      const w = requireWorld();
+      if (msg.ka === w.timeKa) {
+        ready(w, 'time', undefined, false);
+        break;
+      }
+      const years = Math.round(msg.ka * 1000).toLocaleString('en-US');
+      progress(msg.ka === 0 ? 'Back to today' : `Building the world of ${years} years ago`, 0);
+      w.viewTime(msg.ka, progress);
+      ready(w, 'time');
+      break;
+    }
   }
 }
 

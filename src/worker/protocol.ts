@@ -24,7 +24,9 @@ export type Request =
   | { type: 'fitSeaLevel'; landFraction: number }
   | { type: 'save' }
   | { type: 'load'; buffer: ArrayBuffer }
-  | { type: 'export'; what: 'heightmap16' | 'layer'; render: RenderOptions; width: number };
+  | { type: 'export'; what: 'heightmap16' | 'layer'; render: RenderOptions; width: number }
+  /** Show the world as it was `ka` thousand years ago (0 = today). */
+  | { type: 'setTime'; ka: number };
 
 /** Simulation worker → tile workers (over a MessageChannel). */
 export type ContextMessage =
@@ -84,6 +86,25 @@ export interface Arrow {
   plate: number;
 }
 
+/** One slice of the history from the last glacial maximum to today. */
+export interface SliceSummary {
+  ka: number;
+  seaLevel: number;
+  iceAreaKm2: number;
+  landFraction: number;
+  dT: number;
+  co2: number;
+  drift: number;
+  july65N: number;
+}
+
+export interface HistorySummary {
+  slices: SliceSummary[];
+  events: { ka: number; text: string }[];
+  /** False when an edit has made it stale: it is rebuilt when a past time is picked. */
+  built: boolean;
+}
+
 export interface WorldSummary {
   params: WorldParams;
   cells: number;
@@ -98,11 +119,16 @@ export interface WorldSummary {
   undoLabel?: string;
   redoLabel?: string;
   timings: Record<string, number>;
+  /** The time on show (ka; 0 = today) and the history from the last glacial maximum. */
+  timeKa: number;
+  history: HistorySummary;
 }
 
 export interface InspectInfo {
   lat: number;
   lon: number;
+  /** The past time on show, described (null today). */
+  era: string | null;
   elevation: number;
   water: 'ocean' | 'lake' | 'salt lake' | 'salt flat' | null;
   plate: { id: number; name: string; speed: number; dir: string };
@@ -139,6 +165,8 @@ export interface InspectInfo {
   ice: string | null;
   /** What the last ice age did here. */
   iceAge: string | null;
+  /** The surface ocean current here (open sea): its direction, speed and warmth. */
+  current: string | null;
 }
 
 /** Simulation worker → main thread. */

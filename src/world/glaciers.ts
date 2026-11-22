@@ -199,6 +199,14 @@ export function simulateIce(
   radiusKm: number,
   withShelves: boolean,
   initial: Float32Array | null = null,
+  /** Passes to settle (default: more for inherited ice, whose margins melt back a little each pass). */
+  passCount = 0,
+  /**
+   * Where a margin cell's own-climate distance is measured from, in cell
+   * spacings (half a cell in: its centre). Coarse meshes measure from the
+   * margin itself, or a 130-km margin cell would sit in the sheet's full cold.
+   */
+  marginOffset = 0.5,
 ): IceSheet {
   const { n, nbrStart, nbr, nbrDist, area } = mesh;
   const radiusM = radiusKm * 1000;
@@ -321,7 +329,7 @@ export function simulateIce(
         front = next;
       }
       for (const c of members) {
-        const inward = smoothstep(0, OWN_CLIMATE_DIST, (Math.max(0, ring[c]) + 0.5) * spacingKm);
+        const inward = smoothstep(0, OWN_CLIMATE_DIST, (Math.max(0, ring[c]) + marginOffset) * spacingKm);
         own[c] = big * (OWN_CLIMATE_EDGE + (1 - OWN_CLIMATE_EDGE) * inward);
       }
     }
@@ -399,7 +407,7 @@ export function simulateIce(
 
   if (initial) for (const c of cells) thick[c] = initial[c];
   // Inherited ice needs more passes: its margins melt back a little each pass.
-  const passes = initial ? INHERITED_PASSES : 5;
+  const passes = passCount > 0 ? passCount : initial ? INHERITED_PASSES : 5;
   for (let it = 0; it < passes; it++) {
     pass();
     const next = plasticThickness(mesh, bed, cover, radiusM);

@@ -424,6 +424,36 @@ $<HTMLSelectElement>('month').onchange = () => {
   refreshTiles();
 };
 $('rivers').onchange = refreshTiles;
+
+// ------------------------------------------------------------------ time (history since the last ice age)
+
+const timeSel = $<HTMLSelectElement>('time');
+const kaLabel = (ka: number): string => (ka === 0 ? 'Today' : `${Number(ka.toFixed(1))} ka${ka === 21 ? ' (glacial max.)' : ka === 12.5 || ka === 12 ? ' (Younger Dryas)' : ''}`);
+function updateTimeUi(s: WorldSummary): void {
+  const kas = s.history.slices.map((x) => x.ka);
+  const have = Array.from(timeSel.options).map((o) => Number(o.value));
+  if (have.length !== kas.length || have.some((v, i) => v !== kas[i])) {
+    timeSel.innerHTML = '';
+    for (const ka of kas.slice().reverse()) timeSel.add(new Option(kaLabel(ka), String(ka)));
+  }
+  timeSel.value = String(s.timeKa);
+  const slices = s.history.slices;
+  const rows = s.history.built
+    ? s.history.events
+        .map((e) => `<p><b>${e.ka >= 1 ? `${Number(e.ka.toFixed(2))} ka` : `${Math.round(e.ka * 1000)} years ago`}:</b> ${e.text.replace(/[<>&]/g, '')}</p>`)
+        .join('')
+    : '<p class="muted">Edited since the history was built: pick a past time to rebuild it.</p>';
+  const cur = slices.find((x) => x.ka === s.timeKa);
+  const now =
+    s.timeKa > 0 && cur && s.history.built
+      ? `<p class="muted">Showing ${Number(s.timeKa.toFixed(1))} ka: seas ${Math.round(-cur.seaLevel)} m lower, ${(cur.iceAreaKm2 / 1e6).toFixed(1)} million km² more ice, CO₂ ${Math.round(cur.co2)} ppm.</p>`
+      : '';
+  $('deglaciation').innerHTML = now + rows;
+}
+timeSel.onchange = () => {
+  setBusy('Building the past…', 0);
+  send({ type: 'setTime', ka: Number(timeSel.value) });
+};
 $('arrows').onchange = redraw;
 $('hotspots').onchange = redraw;
 
@@ -724,6 +754,7 @@ function applySummary(s: WorldSummary): void {
         .join('')
     : '<p class="muted">No rifting or collisions recorded.</p>';
   $('history').innerHTML = `<p class="muted">${s.params.historyMyr} Myr simulated from a ${s.params.layout === 'supercontinent' ? 'supercontinent' : s.params.layout === 'continents' ? 'several-continent' : 'scattered'} start.</p>${hist}`;
+  updateTimeUi(s);
   updateLayerUi();
 }
 

@@ -99,6 +99,10 @@ export interface FieldData {
   /** Monthly surface temperature (°C) and precipitation (mm), c*12+m. */
   temp: Float32Array;
   precip: Float32Array;
+  /** Surface ocean current (m/s eastward and northward) and the sea-temperature anomaly it carries (°C). */
+  curE: Float32Array;
+  curN: Float32Array;
+  curAnom: Float32Array;
   /** River network: chains of cells in downstream order (CSR). */
   rivStart: Int32Array;
   rivCell: Int32Array;
@@ -1591,6 +1595,9 @@ export function buildFields(world: World, meshId: string, version: number): Fiel
     drainage: fromDonor(hydro.drainage),
     temp: world.temp,
     precip: world.precip,
+    curE: world.currentE,
+    curN: world.currentN,
+    curAnom: world.currentAnom,
     ...rivers,
     ...troughs,
     rivBed: riverBeds(world, rivers, ocean, elev, grad, amp, mtn, troughs.rivGlac, noiseSeed),
